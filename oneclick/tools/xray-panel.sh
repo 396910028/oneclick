@@ -404,19 +404,6 @@ do_update() {
   fi
 }
 
-# 启动时检查更新（可选，不阻塞）
-check_update_on_start() {
-  if check_update >/dev/null 2>&1; then
-    # 有新版本，提示用户
-    echo
-    echo "[update] 检测到新版本可用！"
-    echo "[update] 可在菜单中选择 '7) 检查并更新' 进行更新"
-  fi
-}
-
-# 首次启动时检查更新（后台，不阻塞）
-check_update_on_start &
-
 while true; do
   echo
   echo "==========================================================="
