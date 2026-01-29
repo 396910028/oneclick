@@ -1,0 +1,3 @@
+# 忽略backend和frontend文件夹
+backend/
+frontend/

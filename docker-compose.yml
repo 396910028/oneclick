@@ -1,0 +1,49 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: ip_proxy_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: kangyun0318
+      MYSQL_DATABASE: ip_proxy_platform
+      TZ: Asia/Shanghai
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:3306:3306"   # 只绑定本机，DBeaver 等用 127.0.0.1:3306 连接
+    volumes:
+      - db_data:/var/lib/mysql
+      # 首次启动（空数据卷）会自动执行初始化 SQL
+      - ./db_example_basic.sql:/docker-entrypoint-initdb.d/01_db_example_basic.sql:ro
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ip_proxy_backend
+    restart: unless-stopped
+    depends_on:
+      - db
+    env_file:
+      - ./backend/.env.docker
+    ports:
+      - "3000:3000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ip_proxy_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:3000
+    ports:
+      - "5173:5173"
+
+volumes:
+  db_data:
+
