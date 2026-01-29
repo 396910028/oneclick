@@ -9,6 +9,10 @@ set -euo pipefail
 #
 # 目标：实现“机场级”实时增删用户（无需重启 Xray）
 
+# 当前脚本所在仓库根目录（install-xray-node.sh 刚拉取的那份），用于优先复制 xray-panel.sh 保证版本一致
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
+SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 PANEL_BASE_URL=""
 INTERNAL_TOKEN=""
 NODE_NAME="xray-node"
@@ -579,9 +583,17 @@ systemctl enable --now panel-xray-daemon.service
 
 echo "[tools] 安装本机按键面板脚本：${INSTALL_DIR}/tools/xray-panel.sh ..."
 mkdir -p "${INSTALL_DIR}/tools"
-# 强制从仓库复制最新的 xray-panel.sh（如果存在），否则使用内嵌版本
-if [[ -f "${SRC_DIR}/oneclick/tools/xray-panel.sh" ]]; then
-  cp -f "${SRC_DIR}/oneclick/tools/xray-panel.sh" "${INSTALL_DIR}/tools/xray-panel.sh"
+# 优先从「当前脚本所在仓库」复制 xray-panel.sh（即 install 刚拉取的那份），保证 version 与本次下载一致
+XPANEL_SRC=""
+if [[ -f "${SCRIPT_REPO_ROOT}/oneclick/tools/xray-panel.sh" ]]; then
+  XPANEL_SRC="${SCRIPT_REPO_ROOT}/oneclick/tools/xray-panel.sh"
+  echo "[tools] 使用本次下载仓库中的 xray-panel.sh"
+elif [[ -f "${SRC_DIR}/oneclick/tools/xray-panel.sh" ]]; then
+  XPANEL_SRC="${SRC_DIR}/oneclick/tools/xray-panel.sh"
+  echo "[tools] 使用 daemon 仓库中的 xray-panel.sh"
+fi
+if [[ -n "${XPANEL_SRC}" ]]; then
+  cp -f "${XPANEL_SRC}" "${INSTALL_DIR}/tools/xray-panel.sh"
   echo "[tools] 已从仓库强制覆盖最新版 xray-panel.sh"
 else
   # 内嵌版本（作为后备）

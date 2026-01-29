@@ -252,6 +252,61 @@ sync_once() {
   echo "[sync] 完成。你可以再查看 applied 列表确认。"
 }
 
+# 修改面板地址与 INTERNAL_API_KEY（写入 daemon.env，并重启 connector 使新 key 生效）
+edit_panel_config() {
+  echo "[config] 修改面板地址与 INTERNAL_API_KEY"
+  echo "说明：主面板 Key 变更后需在此处输入新 Key，无法自动从面板获取。"
+  echo
+  
+  local new_url new_key
+  new_url="$(prompt "面板地址（留空不修改）" "${PANEL_BASE_URL:-}")"
+  new_url="$(echo "${new_url}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  
+  echo "INTERNAL_API_KEY（留空不修改，输入不回显）"
+  read -r -s -p "新 Key: " new_key
+  echo
+  new_key="$(echo "${new_key}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  
+  if [[ -z "${new_url}" ]] && [[ -z "${new_key}" ]]; then
+    echo "[info] 未修改任何项"
+    return 0
+  fi
+  
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "[warn] 未找到 ${ENV_FILE}，将创建并写入"
+    mkdir -p "$(dirname "${ENV_FILE}")"
+    touch "${ENV_FILE}"
+  fi
+  
+  if [[ -n "${new_url}" ]]; then
+    if grep -q "^PANEL_BASE_URL=" "${ENV_FILE}" 2>/dev/null; then
+      sed -i "s|^PANEL_BASE_URL=.*|PANEL_BASE_URL=${new_url}|" "${ENV_FILE}"
+    else
+      echo "PANEL_BASE_URL=${new_url}" >> "${ENV_FILE}"
+    fi
+    PANEL_BASE_URL="${new_url}"
+    echo "[ok] 已更新面板地址"
+  fi
+  
+  if [[ -n "${new_key}" ]]; then
+    if grep -q "^INTERNAL_API_KEY=" "${ENV_FILE}" 2>/dev/null; then
+      sed -i "s|^INTERNAL_API_KEY=.*|INTERNAL_API_KEY=${new_key}|" "${ENV_FILE}"
+    else
+      echo "INTERNAL_API_KEY=${new_key}" >> "${ENV_FILE}"
+    fi
+    INTERNAL_API_KEY="${new_key}"
+    echo "[ok] 已更新 INTERNAL_API_KEY"
+  fi
+  
+  # 重启 connector，使新配置生效
+  if systemctl is-active --quiet panel-xray-daemon.service 2>/dev/null; then
+    echo "[info] 重启 panel-xray-daemon 使新 Key 生效..."
+    systemctl restart panel-xray-daemon.service 2>/dev/null && echo "[ok] 已重启 daemon" || echo "[warn] 重启 daemon 失败，请手动执行: systemctl restart panel-xray-daemon"
+  else
+    echo "[info] 下次启动 panel-xray-daemon 时将使用新配置"
+  fi
+}
+
 # 格式化流量显示（字节转 GB/MB）
 format_traffic() {
   local bytes="${1:-0}"
@@ -427,10 +482,11 @@ while true; do
   echo "2) UUID 同步：立即同步一次（connector -once，同步面板允许的UUID到Xray）"
   echo "3) 强制重新注册节点到主面板（register-node，不管是否存在）"
   echo "4) 查询某个 UUID 的流量与状态"
-  echo "5) 切换 node_id"
-  echo "6) 检查并更新（自动卸载重装，保留配置）"
-  echo "7) 退出"
-  read -r -p "请选择操作 [1-7]: " c
+  echo "5) 修改面板地址与 INTERNAL_API_KEY"
+  echo "6) 切换 node_id"
+  echo "7) 检查并更新（自动卸载重装，保留配置）"
+  echo "8) 退出"
+  read -r -p "请选择操作 [1-8]: " c
   case "${c}" in
     1) show_uuid_comparison || echo "[error] 查询失败" ;;
     2) sync_once || echo "[error] UUID 同步失败" ;;
@@ -489,8 +545,9 @@ while true; do
         fi
       fi
       ;;
-    5) NODE_ID="$(prompt "请输入 node_id" "${NODE_ID}")" ;;
-    6)
+    5) edit_panel_config || true ;;
+    6) NODE_ID="$(prompt "请输入 node_id" "${NODE_ID}")" ;;
+    7)
       if check_update; then
         echo
         read -r -p "是否立即更新？(y/N): " confirm
@@ -503,7 +560,7 @@ while true; do
           echo "[info] 已取消更新"
         fi
       else
-        local update_result=$?
+        update_result=$?
         if [[ "${update_result}" == "2" ]]; then
           echo
           read -r -p "发现新版本，是否立即更新？(y/N): " confirm
@@ -518,7 +575,7 @@ while true; do
         fi
       fi
       ;;
-    7) exit 0 ;;
+    8) exit 0 ;;
     *) echo "无效选择" ;;
   esac
 done
