@@ -331,6 +331,23 @@ func reportTrafficOnce(ctx context.Context, cfg config, nodeID int, tag string) 
 	return nil
 }
 
+// appliedEqualsNormalized 比较 applied.json 中的 UUID 列表与面板允许列表是否一致（集合相等）
+func appliedEqualsNormalized(applied, normalized []string) bool {
+	if len(applied) != len(normalized) {
+		return false
+	}
+	set := make(map[string]struct{}, len(normalized))
+	for _, u := range normalized {
+		set[u] = struct{}{}
+	}
+	for _, u := range applied {
+		if _, ok := set[u]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func writeIfChanged(path string, content []byte) (changed bool, err error) {
 	existing, readErr := os.ReadFile(path)
 	if readErr == nil {
@@ -422,7 +439,15 @@ func syncOnce(ctx context.Context, cfg config, lastHash map[int]string) error {
 		appliedPath := filepath.Join(nodeDir, "applied.json")
 
 		hash := sha256Hex(jsonBytes)
-		if lastHash[nodeID] == hash {
+		skipByHash := (lastHash[nodeID] == hash)
+		// xray-grpc 下：若 applied.json 被删或与面板允许列表不一致（如 Xray 重启后 applied 被清空），必须重新 apply，不能仅因 hash 未变就跳过
+		if skipByHash && cfg.ApplyMode == "xray-grpc" {
+			applied, err := loadAppliedState(appliedPath)
+			if err != nil || !appliedEqualsNormalized(applied, normalized) {
+				skipByHash = false
+			}
+		}
+		if skipByHash {
 			continue
 		}
 
