@@ -231,9 +231,12 @@ if [[ -z "${PUBLIC_IP}" ]]; then
 fi
 
 echo "[xray] 生成 Reality keypair + shortId..."
-KEY_OUT="$("${XRAY_BIN}" x25519 2>/dev/null || true)"
-PRIVATE_KEY="$(echo "${KEY_OUT}" | awk -F'[: ]+' '/PrivateKey:/ {print $2} /Private key:/ {print $3}' | head -n1)"
-PUBLIC_KEY="$(echo "${KEY_OUT}" | awk -F'[: ]+' '/PublicKey:/ {print $2} /Public key:/ {print $3}' | head -n1)"
+# 如果已从旧节点复制配置，跳过生成（privateKey/publicKey 已设置）
+if [[ "${USE_OLD_REALITY_CONFIG}" != "true" ]]; then
+  KEY_OUT="$("${XRAY_BIN}" x25519 2>/dev/null || true)"
+  PRIVATE_KEY="$(echo "${KEY_OUT}" | awk -F'[: ]+' '/PrivateKey:/ {print $2} /Private key:/ {print $3}' | head -n1)"
+  PUBLIC_KEY="$(echo "${KEY_OUT}" | awk -F'[: ]+' '/PublicKey:/ {print $2} /Public key:/ {print $3}' | head -n1)"
+fi
 if [[ -z "${PRIVATE_KEY}" || -z "${PUBLIC_KEY}" ]]; then
   echo "[xray] x25519 未输出完整 keypair（部分版本只输出 PrivateKey），改用 sing-box 生成 Reality keypair..."
 
@@ -439,6 +442,49 @@ EOF
 systemctl daemon-reload
 systemctl enable --now panel-xray.service
 
+echo "[panel] 检查并清理同一机器的旧节点..."
+# 如果本地已有 node.json，读取旧 node_id 并尝试删除（复制其 Reality 配置）
+OLD_NODE_ID=""
+USE_OLD_REALITY_CONFIG=false
+if [[ -f "${INSTALL_DIR}/node.json" ]]; then
+  OLD_NODE_ID="$(jq -r '.node_id // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
+  if [[ -n "${OLD_NODE_ID}" && "${OLD_NODE_ID}" != "null" ]]; then
+    echo "[panel] 发现本地旧节点 node_id=${OLD_NODE_ID}，尝试获取其 Reality 配置..."
+    # 读取旧节点的 Reality 配置（publicKey/shortId/SNI）
+    OLD_NODE_CONFIG="$(jq -r '.config // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
+    if [[ -n "${OLD_NODE_CONFIG}" && "${OLD_NODE_CONFIG}" != "null" ]]; then
+      OLD_PUBLIC_KEY="$(echo "${OLD_NODE_CONFIG}" | jq -r '.publicKey // empty' 2>/dev/null || echo "")"
+      OLD_SHORT_ID="$(echo "${OLD_NODE_CONFIG}" | jq -r '.shortId // empty' 2>/dev/null || echo "")"
+      OLD_SNI="$(echo "${OLD_NODE_CONFIG}" | jq -r '.sni // empty' 2>/dev/null || echo "")"
+      # 如果 Xray 配置已存在，尝试读取其 privateKey（用于配对 publicKey）
+      OLD_PRIVATE_KEY=""
+      if [[ -f /etc/xray/config.json ]]; then
+        OLD_PRIVATE_KEY="$(jq -r '.inbounds[]? | select(.tag=="in-vless-reality") | .streamSettings.realitySettings.privateKey // empty' /etc/xray/config.json 2>/dev/null || echo "")"
+      fi
+      if [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" && -n "${OLD_PRIVATE_KEY}" ]]; then
+        echo "[panel] 复制旧节点的 Reality 配置（保持客户端配置不变）："
+        echo "  publicKey=${OLD_PUBLIC_KEY:0:20}..."
+        echo "  shortId=${OLD_SHORT_ID}"
+        echo "  sni=${OLD_SNI}"
+        PUBLIC_KEY="${OLD_PUBLIC_KEY}"
+        SHORT_ID="${OLD_SHORT_ID}"
+        PRIVATE_KEY="${OLD_PRIVATE_KEY}"
+        if [[ -n "${OLD_SNI}" ]]; then
+          SNI="${OLD_SNI}"
+        fi
+        USE_OLD_REALITY_CONFIG=true
+      elif [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" ]]; then
+        echo "[panel] 警告：旧节点有 publicKey/shortId，但无法读取 privateKey，将生成新密钥对（客户端需更新配置）"
+      fi
+    fi
+    echo "[panel] 尝试删除旧节点 node_id=${OLD_NODE_ID}（如果 internal token 有权限）..."
+    curl -fsS -X DELETE -H "x-internal-token: ${INTERNAL_TOKEN}" \
+      "${PANEL_BASE_URL%/}/api/admin/nodes/${OLD_NODE_ID}" >/dev/null 2>&1 && \
+      echo "[panel] 已删除旧节点" || \
+      echo "[panel] 删除旧节点失败（可能无权限），register-node 会按 address+port+protocol 幂等更新"
+  fi
+fi
+
 echo "[panel] 向面板注册节点..."
 NODE_CONFIG_JSON="$(jq -nc \
   --arg security "reality" \
@@ -519,7 +565,15 @@ echo "[daemon] 准备 node-daemon（connector xray-grpc 模式）..."
 # 【重要】清除旧的 applied.json，防止重装后 connector 不重新添加用户
 # 这是因为 Xray 重装后用户列表被清空，但旧的 applied.json 还存在
 echo "[cleanup] 清除旧的 applied state..."
+# 清除所有旧节点的 applied.json（包括已删除的旧 node_id）
+if [[ -n "${OLD_NODE_ID}" && "${OLD_NODE_ID}" != "null" && "${OLD_NODE_ID}" != "${NODE_ID}" ]]; then
+  echo "[cleanup] 清除旧节点 node_id=${OLD_NODE_ID} 的 applied.json..."
+  rm -f "${INSTALL_DIR}/out/node-${OLD_NODE_ID}/applied.json" 2>/dev/null || true
+fi
+# 清除所有其他节点的 applied.json（确保一台机器只管理一个节点）
 rm -f "${INSTALL_DIR}/out/node-*/applied.json" 2>/dev/null || true
+# 但保留当前新节点的目录结构（如果已存在）
+mkdir -p "${INSTALL_DIR}/out/node-${NODE_ID}" 2>/dev/null || true
 
 SRC_DIR="${INSTALL_DIR}/src"
 mkdir -p "${SRC_DIR}"
@@ -553,6 +607,7 @@ mkdir -p "${INSTALL_DIR}/bin" "${INSTALL_DIR}/out"
 cat > "${INSTALL_DIR}/daemon.env" <<EOF
 PANEL_BASE_URL=${PANEL_BASE_URL}
 INTERNAL_API_KEY=${INTERNAL_TOKEN}
+# 【重要】一台机器只管理一个节点，NODE_IDS 只保留最新的 node_id
 NODE_IDS=${NODE_ID}
 OUTPUT_DIR=${INSTALL_DIR}/out
 INTERVAL_SECONDS=${SYNC_INTERVAL}
