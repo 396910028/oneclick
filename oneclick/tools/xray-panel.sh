@@ -129,11 +129,12 @@ show_uuid_comparison() {
   printf "%-40s %-12s %-12s\n" "UUID" "面板允许" "Xray已应用"
   echo "-----------------------------------------------------------"
   
+  need_sync=false
   while IFS= read -r uuid; do
     [[ -z "${uuid}" ]] && continue
     
-    local panel_allowed="FALSE"
-    local xray_applied="FALSE"
+    panel_allowed="FALSE"
+    xray_applied="FALSE"
     
     # 检查面板允许
     if echo "${allowed_uuids}" | grep -qFx "${uuid}" 2>/dev/null; then
@@ -146,6 +147,10 @@ show_uuid_comparison() {
     fi
     
     printf "%-40s %-12s %-12s\n" "${uuid}" "${panel_allowed}" "${xray_applied}"
+    # 发现「面板允许但未应用」则标记需要同步
+    if [[ "${panel_allowed}" == "TRUE" && "${xray_applied}" == "FALSE" ]]; then
+      need_sync=true
+    fi
   done <<< "${all_uuids}"
   
   echo "==========================================================="
@@ -154,6 +159,17 @@ show_uuid_comparison() {
   echo "  - 面板允许=TRUE, Xray已应用=FALSE：需要执行 UUID 同步（选项 2）"
   echo "  - 面板允许=FALSE, Xray已应用=TRUE：用户已被移除，Xray 中应删除"
   echo "  - 两者都为 TRUE：正常状态"
+  echo
+
+  # 发现未自动应用时，自动执行一次同步
+  if [[ "${need_sync}" == "true" ]]; then
+    echo "[auto] 检测到「面板允许但 Xray 未应用」，正在自动同步一次..."
+    if sync_once 2>/dev/null; then
+      echo "[auto] 同步完成，请再次查看状态对比确认。"
+    else
+      echo "[auto] 自动同步失败，请手动选择「2) UUID 同步」或检查 daemon.env / connector 日志。"
+    fi
+  fi
 }
 
 node_info_file="${INSTALL_DIR}/node.json"
