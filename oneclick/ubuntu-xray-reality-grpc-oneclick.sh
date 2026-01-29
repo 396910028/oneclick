@@ -401,6 +401,11 @@ cat > /etc/xray/config.json <<EOF
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["in-vless-reality"],
+        "outboundTag": "direct"
       }
     ]
   },
