@@ -23,6 +23,7 @@ INSTALL_DIR="/opt/panel-node-xray"
 REPO_URL="https://github.com/396910028/oneclick.git"
 XRAY_API_PORT="10085"
 SYNC_INTERVAL="10"
+USE_OLD_REALITY_CONFIG=false
 VLESS_FLOW="xtls-rprx-vision"
 
 prompt() {
@@ -228,6 +229,37 @@ fi
 PUBLIC_IP="$(curl -fsSL https://api.ipify.org || true)"
 if [[ -z "${PUBLIC_IP}" ]]; then
   PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+fi
+
+echo "[panel] 检查并清理同一机器的旧节点（复制 Reality 配置则跳过生成新密钥）..."
+OLD_NODE_ID=""
+if [[ -f "${INSTALL_DIR}/node.json" ]]; then
+  OLD_NODE_ID="$(jq -r '.node_id // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
+  if [[ -n "${OLD_NODE_ID}" && "${OLD_NODE_ID}" != "null" ]]; then
+    echo "[panel] 发现本地旧节点 node_id=${OLD_NODE_ID}，尝试获取其 Reality 配置..."
+    OLD_NODE_CONFIG="$(jq -r '.config // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
+    if [[ -n "${OLD_NODE_CONFIG}" && "${OLD_NODE_CONFIG}" != "null" ]]; then
+      OLD_PUBLIC_KEY="$(echo "${OLD_NODE_CONFIG}" | jq -r '.publicKey // empty' 2>/dev/null || echo "")"
+      OLD_SHORT_ID="$(echo "${OLD_NODE_CONFIG}" | jq -r '.shortId // empty' 2>/dev/null || echo "")"
+      OLD_SNI="$(echo "${OLD_NODE_CONFIG}" | jq -r '.sni // empty' 2>/dev/null || echo "")"
+      OLD_PRIVATE_KEY=""
+      if [[ -f /etc/xray/config.json ]]; then
+        OLD_PRIVATE_KEY="$(jq -r '.inbounds[]? | select(.tag=="in-vless-reality") | .streamSettings.realitySettings.privateKey // empty' /etc/xray/config.json 2>/dev/null || echo "")"
+      fi
+      if [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" && -n "${OLD_PRIVATE_KEY}" ]]; then
+        echo "[panel] 复制旧节点的 Reality 配置（保持客户端配置不变）"
+        PUBLIC_KEY="${OLD_PUBLIC_KEY}"
+        SHORT_ID="${OLD_SHORT_ID}"
+        PRIVATE_KEY="${OLD_PRIVATE_KEY}"
+        if [[ -n "${OLD_SNI}" ]]; then
+          SNI="${OLD_SNI}"
+        fi
+        USE_OLD_REALITY_CONFIG=true
+      elif [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" ]]; then
+        echo "[panel] 警告：旧节点有 publicKey/shortId，但无法读取 privateKey，将生成新密钥对（客户端需更新配置）"
+      fi
+    fi
+  fi
 fi
 
 echo "[xray] 生成 Reality keypair + shortId..."
@@ -442,47 +474,14 @@ EOF
 systemctl daemon-reload
 systemctl enable --now panel-xray.service
 
-echo "[panel] 检查并清理同一机器的旧节点..."
-# 如果本地已有 node.json，读取旧 node_id 并尝试删除（复制其 Reality 配置）
-OLD_NODE_ID=""
-USE_OLD_REALITY_CONFIG=false
-if [[ -f "${INSTALL_DIR}/node.json" ]]; then
-  OLD_NODE_ID="$(jq -r '.node_id // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
-  if [[ -n "${OLD_NODE_ID}" && "${OLD_NODE_ID}" != "null" ]]; then
-    echo "[panel] 发现本地旧节点 node_id=${OLD_NODE_ID}，尝试获取其 Reality 配置..."
-    # 读取旧节点的 Reality 配置（publicKey/shortId/SNI）
-    OLD_NODE_CONFIG="$(jq -r '.config // empty' "${INSTALL_DIR}/node.json" 2>/dev/null || echo "")"
-    if [[ -n "${OLD_NODE_CONFIG}" && "${OLD_NODE_CONFIG}" != "null" ]]; then
-      OLD_PUBLIC_KEY="$(echo "${OLD_NODE_CONFIG}" | jq -r '.publicKey // empty' 2>/dev/null || echo "")"
-      OLD_SHORT_ID="$(echo "${OLD_NODE_CONFIG}" | jq -r '.shortId // empty' 2>/dev/null || echo "")"
-      OLD_SNI="$(echo "${OLD_NODE_CONFIG}" | jq -r '.sni // empty' 2>/dev/null || echo "")"
-      # 如果 Xray 配置已存在，尝试读取其 privateKey（用于配对 publicKey）
-      OLD_PRIVATE_KEY=""
-      if [[ -f /etc/xray/config.json ]]; then
-        OLD_PRIVATE_KEY="$(jq -r '.inbounds[]? | select(.tag=="in-vless-reality") | .streamSettings.realitySettings.privateKey // empty' /etc/xray/config.json 2>/dev/null || echo "")"
-      fi
-      if [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" && -n "${OLD_PRIVATE_KEY}" ]]; then
-        echo "[panel] 复制旧节点的 Reality 配置（保持客户端配置不变）："
-        echo "  publicKey=${OLD_PUBLIC_KEY:0:20}..."
-        echo "  shortId=${OLD_SHORT_ID}"
-        echo "  sni=${OLD_SNI}"
-        PUBLIC_KEY="${OLD_PUBLIC_KEY}"
-        SHORT_ID="${OLD_SHORT_ID}"
-        PRIVATE_KEY="${OLD_PRIVATE_KEY}"
-        if [[ -n "${OLD_SNI}" ]]; then
-          SNI="${OLD_SNI}"
-        fi
-        USE_OLD_REALITY_CONFIG=true
-      elif [[ -n "${OLD_PUBLIC_KEY}" && -n "${OLD_SHORT_ID}" ]]; then
-        echo "[panel] 警告：旧节点有 publicKey/shortId，但无法读取 privateKey，将生成新密钥对（客户端需更新配置）"
-      fi
-    fi
-    echo "[panel] 尝试删除旧节点 node_id=${OLD_NODE_ID}（如果 internal token 有权限）..."
-    curl -fsS -X DELETE -H "x-internal-token: ${INTERNAL_TOKEN}" \
-      "${PANEL_BASE_URL%/}/api/admin/nodes/${OLD_NODE_ID}" >/dev/null 2>&1 && \
-      echo "[panel] 已删除旧节点" || \
-      echo "[panel] 删除旧节点失败（可能无权限），register-node 会按 address+port+protocol 幂等更新"
-  fi
+echo "[panel] 删除面板中的旧节点（若存在）..."
+# OLD_NODE_ID 已在前面「检查并清理」阶段从 node.json 读取
+if [[ -n "${OLD_NODE_ID}" && "${OLD_NODE_ID}" != "null" ]]; then
+  echo "[panel] 尝试删除旧节点 node_id=${OLD_NODE_ID}（如果 internal token 有权限）..."
+  curl -fsS -X DELETE -H "x-internal-token: ${INTERNAL_TOKEN}" \
+    "${PANEL_BASE_URL%/}/api/admin/nodes/${OLD_NODE_ID}" >/dev/null 2>&1 && \
+    echo "[panel] 已删除旧节点" || \
+    echo "[panel] 删除旧节点失败（可能无权限），register-node 会按 address+port+protocol 幂等更新"
 fi
 
 echo "[panel] 向面板注册节点..."
