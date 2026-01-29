@@ -343,10 +343,22 @@ do_update() {
   echo "[update] 重新安装（从 GitHub 拉取最新代码）..."
   echo
   
-  # 使用 install-xray-node.sh 重新安装
-  local install_script_url="https://raw.githubusercontent.com/396910028/oneclick/master/oneclick/install-xray-node.sh"
+  # 导出配置，让安装脚本不再提示面板地址和 INTERNAL_API_KEY
+  export PANEL_BASE_URL="${saved_panel_url}"
+  export INTERNAL_TOKEN="${saved_internal_key}"
+  export INTERNAL_API_KEY="${saved_internal_key}"
   
-  if curl -fsSL "${install_script_url}" | bash; then
+  # 下载安装脚本到临时文件，用 /dev/tty 作为 stdin，这样脚本里其余提示（节点名、端口等）仍可输入
+  local install_script_url="https://raw.githubusercontent.com/396910028/oneclick/master/oneclick/install-xray-node.sh"
+  local install_script_tmp="/tmp/install-xray-node-update-$$.sh"
+  
+  if ! curl -fsSL "${install_script_url}" -o "${install_script_tmp}"; then
+    echo "[error] 下载安装脚本失败"
+    return 1
+  fi
+  
+  if bash "${install_script_tmp}" < /dev/tty; then
+    rm -f "${install_script_tmp}" 2>/dev/null || true
     echo
     echo "[update] 安装完成，恢复配置..."
     
@@ -395,6 +407,7 @@ do_update() {
     
     return 0
   else
+    rm -f "${install_script_tmp}" 2>/dev/null || true
     echo
     echo "[error] 安装失败！"
     echo "[info] 备份文件保存在：${backup_dir}"
