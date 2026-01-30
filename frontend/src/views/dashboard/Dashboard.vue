@@ -444,6 +444,11 @@ async function handleSignin() {
 
     message.success(apiMessage || '签到成功');
     startSigninCountdown();
+    // 签到可能创建/延长套餐与流量：刷新当前套餐与用户信息
+    await Promise.allSettled([
+      fetchCurrentPlan(),
+      fetchUserInfo()
+    ]);
   } catch (e) {
     message.error(e?.message || '签到失败，请稍后再试');
   } finally {
