@@ -13,6 +13,12 @@ export function deleteAdminUser(id) {
 export function getAdminUserDetail(id) {
   return http.get(`/admin/users/${id}`);
 }
+export function getAdminUserRemaining(id) {
+  return http.get(`/admin/users/${id}/remaining`);
+}
+export function postAdminUserUnsubscribe(userId, data) {
+  return http.post(`/admin/users/${userId}/unsubscribe`, data);
+}
 
 // 总套餐管理
 export function getAdminPlanGroups() {
@@ -94,6 +100,17 @@ export function postAdminNodeAgentImport(data) {
 // 面板设置：INTERNAL_API_KEY
 export function getAdminInternalApiKey() {
   return http.get('/admin/settings/internal-api-key');
+}
+export function postAdminInternalApiKey(data) {
+  return http.post('/admin/settings/internal-api-key', data);
+}
+
+// 面板设置：面板网址
+export function getAdminPanelSettings() {
+  return http.get('/admin/settings/panel');
+}
+export function putAdminPanelSettings(data) {
+  return http.put('/admin/settings/panel', data);
 }
 
 export function updateAdminInternalApiKey(value) {

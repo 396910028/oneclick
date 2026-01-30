@@ -67,7 +67,19 @@ const columns = [
   { title: '用户', key: 'username', minWidth: 90, maxWidth: 140, ellipsis: { tooltip: true } },
   { title: '套餐', key: 'plan_name', minWidth: 100, maxWidth: 180, ellipsis: { tooltip: true } },
   { title: '金额', key: 'amount', width: 90, render: (row) => `¥${row.amount}` },
-  { title: '时长', key: 'duration_days', width: 80, render: (row) => row.duration_days ? `${row.duration_days} 天` : '-' },
+  { title: '时长', key: 'duration_days', width: 80, render: (row) => row.duration_days != null ? `${row.duration_days} 天` : '-' },
+  {
+    title: '流量',
+    key: 'traffic_amount',
+    width: 90,
+    render: (row) => {
+      const bytes = Number(row.traffic_amount) || 0;
+      if (bytes === 0) return '-';
+      const gb = (bytes / (1024 ** 3)).toFixed(2);
+      return bytes > 0 ? gb + ' GB' : gb + ' GB';
+    }
+  },
+  { title: '备注', key: 'remark', width: 100, ellipsis: { tooltip: true }, render: (row) => row.remark || '-' },
   { title: '状态', key: 'status', width: 90, render: (row) => {
     const o = statusMap[row.status] || { type: 'default', label: row.status };
     return h(NTag, { type: o.type }, () => o.label);

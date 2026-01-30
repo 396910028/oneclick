@@ -199,20 +199,25 @@ const trafficText = computed(() => {
 
   // 不再使用“无限”文案：total <= 0 统一视为当前没有可用流量配额
   if (!Number.isFinite(total) || total <= 0) {
-    return `0GB（未分配流量，已用 ${usedGB}GB）`;
+    return used > 0 ? `无流量（已用 ${usedGB}GB）` : '无流量';
   }
 
   const remaining = Math.max(0, total - used);
   const totalGB = (total / 1073741824).toFixed(2);
   const remainingGB = (remaining / 1073741824).toFixed(2);
+  if (remaining <= 0) {
+    return '无流量';
+  }
   const percent = Math.min(100, (used / total) * 100).toFixed(1);
   return `${remainingGB}GB / ${totalGB}GB (已用 ${percent}%)`;
 });
 
+const shareUrl = ref('');
+
 function getSubscriptionUrl(format) {
   if (!subscriptionToken.value) return '';
-  const baseUrl = window.location.origin;
-  return `${baseUrl}/api/sub/${subscriptionToken.value}?format=${format}`;
+  const base = shareUrl.value || window.location.origin;
+  return `${base}/api/sub/${subscriptionToken.value}?format=${format}`;
 }
 
 function copyToClipboard(text) {
@@ -293,6 +298,7 @@ async function fetchSubscriptionToken() {
   try {
     const res = await getSubscriptionToken();
     subscriptionToken.value = res.data.token;
+    shareUrl.value = res.data.share_url || '';
   } catch (e) {
     // 订阅 token 获取失败不影响总览页展示
     console.error('获取订阅 token 失败:', e);

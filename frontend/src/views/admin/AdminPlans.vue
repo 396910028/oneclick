@@ -53,6 +53,12 @@
           />
           <span class="form-hint">互斥：该总套餐与其他互斥总套餐不能同时生效（同一总套餐下的子套餐可以共存/升级）</span>
         </n-form-item>
+        <n-form-item label="共享设备数" path="connections">
+          <n-input-number v-model:value="groupForm.connections" :min="1" style="width: 100%" placeholder="该总套餐下所有子套餐共用" />
+        </n-form-item>
+        <n-form-item label="限速 (Mbps)" path="speed_limit">
+          <n-input-number v-model:value="groupForm.speed_limit" :min="0" style="width: 100%" placeholder="0 表示不限速" />
+        </n-form-item>
         <n-form-item label="套餐列表展示" path="is_public">
           <n-switch v-model:value="groupForm.is_public" :checked-value="1" :unchecked-value="0" />
           <span class="form-hint">关闭后，该总套餐及其下所有子套餐均不在用户端「套餐列表」中显示</span>
@@ -98,15 +104,9 @@
         <n-form-item label="持续时间（天）" path="duration_days" required>
           <n-input-number v-model:value="planForm.duration_days" :min="1" style="width: 100%" placeholder="必填，例如：30（月）、365（年）" />
         </n-form-item>
-        <n-divider style="margin: 12px 0;">限制</n-divider>
-        <n-form-item label="流量(GB)" path="traffic_limit">
-          <n-input-number v-model:value="planForm.traffic_limit_gb" :min="0" style="width: 100%" placeholder="0=不可使用，>0 为流量(GB)" />
-        </n-form-item>
-        <n-form-item label="限速(Mbps)" path="speed_limit">
-          <n-input-number v-model:value="planForm.speed_limit" :min="0" style="width: 100%" placeholder="0 表示不限" />
-        </n-form-item>
-        <n-form-item label="设备数" path="connections">
-          <n-input-number v-model:value="planForm.connections" :min="1" style="width: 100%" />
+        <n-divider style="margin: 12px 0;">流量（设备数、限速由总套餐决定）</n-divider>
+        <n-form-item label="流量 (GB)" path="traffic_limit">
+          <n-input-number v-model:value="planForm.traffic_limit_gb" :min="0" style="width: 100%" placeholder="0=无流量，>0 为套餐流量(GB)" />
         </n-form-item>
         <n-form-item label="状态" path="status_plan">
           <n-space>
@@ -173,7 +173,9 @@ const groupForm = ref({
   level: 0,
   is_exclusive: 0,
   status: 1,
-  is_public: 1
+  is_public: 1,
+  connections: 1,
+  speed_limit: 0
 });
 
 const isEditingGroup = computed(() => editGroupId.value != null);
@@ -194,6 +196,13 @@ const groupColumns = [
     key: 'is_exclusive',
     width: 80,
     render: (row) => (row.is_exclusive ? '互斥' : '可共享')
+  },
+  { title: '设备', key: 'connections', width: 60 },
+  {
+    title: '限速',
+    key: 'speed_limit',
+    width: 80,
+    render: (row) => (row.speed_limit ? row.speed_limit + ' Mbps' : '不限')
   },
   {
     title: '状态',
@@ -281,8 +290,6 @@ const planForm = ref({
   price: 0,
   duration_days: 30,
   traffic_limit_gb: 0,
-  speed_limit: 0,
-  connections: 1,
   is_public: 1,
   status: 1
 });
@@ -318,10 +325,9 @@ const planColumns = [
     width: 90,
     render: (row) => {
       const gb = row.traffic_limit ? Math.floor(row.traffic_limit / 1024 ** 3) : 0;
-      return gb === 0 ? '0G(不可用)' : gb + 'GB';
+      return gb === 0 ? '无流量' : gb + 'GB';
     }
   },
-  { title: '设备', key: 'connections', width: 60 },
   {
     title: '状态',
     key: 'status_row',
@@ -401,7 +407,9 @@ function getDefaultGroupForm() {
     level: 0,
     is_exclusive: 0,
     status: 1,
-    is_public: 1
+    is_public: 1,
+    connections: 1,
+    speed_limit: 0
   };
 }
 
@@ -424,7 +432,9 @@ function editGroup(row) {
     level: row.level ?? 0,
     is_exclusive: row.is_exclusive ?? 0,
     status: row.status ?? 1,
-    is_public: row.is_public != null ? Number(row.is_public) : 1
+    is_public: row.is_public != null ? Number(row.is_public) : 1,
+    connections: Number(row.connections) || 1,
+    speed_limit: Number(row.speed_limit) || 0
   };
   showGroupModal.value = true;
 }
@@ -509,8 +519,6 @@ function getDefaultPlanForm() {
     price: 0,
     duration_days: 30,
     traffic_limit_gb: 0,
-    speed_limit: 0,
-    connections: 1,
     is_public: 1,
     status: 1
   };
@@ -544,8 +552,6 @@ function editPlan(row) {
     price: Number(row.price) || 0,
     duration_days: Number(row.duration_days) || 30,
     traffic_limit_gb: Math.floor(bytes / (1024 ** 3)),
-    speed_limit: Number(row.speed_limit) || 0,
-    connections: Number(row.connections) || 1,
     is_public: row.is_public != null ? Number(row.is_public) : 1,
     status: row.status != null ? Number(row.status) : 1
   };
@@ -565,6 +571,8 @@ async function submitPlan() {
     traffic_limit: gb * (1024 ** 3)
   };
   delete payload.traffic_limit_gb;
+  delete payload.speed_limit;
+  delete payload.connections;
   planSubmitLoading.value = true;
   try {
     if (editPlanId.value) {

@@ -18,7 +18,10 @@ router.get('/', auth, async (req, res, next) => {
               o.amount,
               o.status,
               o.pay_method,
+              o.order_type,
               o.duration_days,
+              o.traffic_amount,
+              o.remark,
               o.created_at,
               o.paid_at,
               DATE_ADD(o.created_at, INTERVAL 30 MINUTE) AS pay_expire_at,
@@ -116,6 +119,258 @@ router.get('/current', auth, async (req, res, next) => {
       }
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/orders/current/remaining 获取当前套餐剩余天数和流量（用于退订）
+router.get('/current/remaining', auth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+
+    // 获取用户当前所有已支付订单（购买和退订）
+    const [orderRows] = await pool.query(
+      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
+              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
+       FROM orders o
+       JOIN plans p ON o.plan_id = p.id
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
+       ORDER BY o.paid_at ASC, o.id ASC`,
+      [userId]
+    );
+
+    if (orderRows.length === 0) {
+      return res.json({
+        code: 200,
+        message: 'success',
+        data: {
+          remaining_days: 0,
+          remaining_traffic_bytes: 0,
+          current_plan: null,
+          can_unsubscribe: false
+        }
+      });
+    }
+
+    // 按总套餐分组计算剩余
+    const byGroup = new Map();
+    for (const o of orderRows) {
+      const gid = o.group_id;
+      if (!byGroup.has(gid)) {
+        byGroup.set(gid, {
+          group_id: gid,
+          group_name: o.group_name,
+          plan_name: o.plan_name,
+          orders: []
+        });
+      }
+      byGroup.get(gid).orders.push(o);
+    }
+
+    // 计算每个总套餐的剩余天数和流量
+    const now = new Date();
+    let maxRemainingDays = 0;
+    let maxRemainingTraffic = 0;
+    let currentPlanInfo = null;
+
+    for (const [gid, groupInfo] of byGroup) {
+      let totalDays = 0;
+      let totalTraffic = 0;
+      let earliestPaidAt = null;
+
+      for (const o of groupInfo.orders) {
+        const paidAt = new Date(o.paid_at);
+        if (!earliestPaidAt || paidAt < earliestPaidAt) {
+          earliestPaidAt = paidAt;
+        }
+        const days = Number(o.duration_days || 0);
+        const traffic = Number(o.traffic_amount || 0);
+        totalDays += days;
+        totalTraffic += traffic;
+      }
+
+      if (earliestPaidAt && totalDays > 0) {
+        const expireAt = new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000);
+        const remainingMs = expireAt.getTime() - now.getTime();
+        const remainingDays = Math.max(0, Math.floor(remainingMs / (24 * 60 * 60 * 1000)));
+
+        // 用户总流量配额 - 已用流量 = 剩余流量
+        const [userRows] = await pool.query(
+          'SELECT traffic_total, traffic_used FROM users WHERE id = ? LIMIT 1',
+          [userId]
+        );
+        const userTrafficTotal = userRows.length > 0 ? Number(userRows[0].traffic_total || 0) : 0;
+        const userTrafficUsed = userRows.length > 0 ? Number(userRows[0].traffic_used || 0) : 0;
+        const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
+
+        if (remainingDays > maxRemainingDays || (remainingDays === maxRemainingDays && remainingTraffic > maxRemainingTraffic)) {
+          maxRemainingDays = remainingDays;
+          maxRemainingTraffic = remainingTraffic;
+          currentPlanInfo = {
+            group_id: gid,
+            group_name: groupInfo.group_name,
+            plan_name: groupInfo.plan_name,
+            expire_at: expireAt.toISOString()
+          };
+        }
+      }
+    }
+
+    res.json({
+      code: 200,
+      message: 'success',
+      data: {
+        remaining_days: maxRemainingDays,
+        remaining_traffic_bytes: maxRemainingTraffic,
+        remaining_traffic_gb: (maxRemainingTraffic / (1024 ** 3)).toFixed(2),
+        current_plan: currentPlanInfo,
+        can_unsubscribe: maxRemainingDays > 0 || maxRemainingTraffic > 0
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/orders/unsubscribe 个人中心退订（扣减时长与流量）
+router.post('/unsubscribe', auth, async (req, res, next) => {
+  const connection = await pool.getConnection();
+  try {
+    const userId = req.user.id;
+    const { duration_days_deduct = 0, traffic_gb_deduct = 0, remark = '', full_refund = false } = req.body;
+
+    const daysDeduct = Math.max(0, Number(duration_days_deduct) || 0);
+    const gbDeduct = Math.max(0, Number(traffic_gb_deduct) || 0);
+    const trafficBytesDeduct = Math.round(gbDeduct * 1073741824);
+
+    if (!full_refund && daysDeduct <= 0 && trafficBytesDeduct <= 0) {
+      connection.release();
+      return res.status(400).json({
+        code: 400,
+        message: '请填写扣减天数或扣减流量（GB）至少一项，或选择全额退订',
+        data: null
+      });
+    }
+
+    // 获取用户当前套餐剩余
+    const [orderRows] = await pool.query(
+      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
+              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
+       FROM orders o
+       JOIN plans p ON o.plan_id = p.id
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
+       ORDER BY o.paid_at ASC, o.id ASC`,
+      [userId]
+    );
+
+    if (orderRows.length === 0) {
+      connection.release();
+      return res.status(400).json({
+        code: 400,
+        message: '您当前没有生效的套餐',
+        data: null
+      });
+    }
+
+    // 计算剩余天数和流量
+    const [userRows] = await connection.query(
+      'SELECT traffic_total, traffic_used, expired_at FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const user = userRows[0];
+    const userTrafficTotal = Number(user.traffic_total || 0);
+    const userTrafficUsed = Number(user.traffic_used || 0);
+    const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
+
+    // 计算剩余天数（从最早订单开始累加）
+    let totalDays = 0;
+    let earliestPaidAt = null;
+    for (const o of orderRows) {
+      const paidAt = new Date(o.paid_at);
+      if (!earliestPaidAt || paidAt < earliestPaidAt) {
+        earliestPaidAt = paidAt;
+      }
+      totalDays += Number(o.duration_days || 0);
+    }
+    const now = new Date();
+    const expireAt = earliestPaidAt ? new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000) : null;
+    const remainingDays = expireAt && expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+
+    let finalDaysDeduct = daysDeduct;
+    let finalTrafficDeduct = trafficBytesDeduct;
+
+    if (full_refund) {
+      finalDaysDeduct = remainingDays;
+      finalTrafficDeduct = remainingTraffic;
+    } else {
+      // 检查是否超限
+      if (finalDaysDeduct > remainingDays) {
+        connection.release();
+        return res.status(400).json({
+          code: 400,
+          message: `扣减天数（${finalDaysDeduct}）超过剩余天数（${remainingDays}），无法退订`,
+          data: null
+        });
+      }
+      if (finalTrafficDeduct > remainingTraffic) {
+        connection.release();
+        return res.status(400).json({
+          code: 400,
+          message: `扣减流量（${(finalTrafficDeduct / (1024 ** 3)).toFixed(2)} GB）超过剩余流量（${(remainingTraffic / (1024 ** 3)).toFixed(2)} GB），无法退订`,
+          data: null
+        });
+      }
+    }
+
+    await connection.beginTransaction();
+
+    // 使用第一个订单的 plan_id
+    const planId = orderRows[0].plan_id;
+    const orderNo = `UNSUB${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+    await connection.query(
+      `INSERT INTO orders
+       (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, remark, created_at, paid_at)
+       VALUES (?, ?, ?, 0, 'balance', 'paid', 'unsubscribe', ?, ?, ?, NOW(), NOW())`,
+      [userId, planId, orderNo, -finalDaysDeduct, -finalTrafficDeduct, (remark || '').slice(0, 255)]
+    );
+
+    // 扣减流量（不退订时不改变到期时间）
+    if (finalTrafficDeduct > 0) {
+      await connection.query(
+        'UPDATE users SET traffic_total = GREATEST(0, traffic_total - ?) WHERE id = ?',
+        [finalTrafficDeduct, userId]
+      );
+    }
+
+    // 检查是否全额退订或超限，如果是则剔出套餐（设置 expired_at 为当前时间）
+    const shouldRemovePlan = full_refund || finalDaysDeduct >= remainingDays || finalTrafficDeduct >= remainingTraffic;
+    if (shouldRemovePlan) {
+      await connection.query(
+        'UPDATE users SET expired_at = NOW() WHERE id = ?',
+        [userId]
+      );
+    }
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      code: 200,
+      message: shouldRemovePlan ? '全额退订已生效，套餐已失效' : '退订已生效，已扣减流量',
+      data: {
+        order_no: orderNo,
+        removed_from_plan: shouldRemovePlan
+      }
+    });
+  } catch (err) {
+    try {
+      await connection.rollback();
+    } catch (e) {
+      // ignore
+    }
+    connection.release();
     next(err);
   }
 });
@@ -685,6 +940,7 @@ router.post('/', auth, async (req, res, next) => {
     }
 
     const durationDays = Number(plan.duration_days || 30);
+    const trafficAmount = Number(plan.traffic_limit || 0);
 
     // 生成简单订单号：时间戳 + 随机数
     const orderNo = `ORD${Date.now()}${Math.floor(Math.random() * 1000)
@@ -701,27 +957,35 @@ router.post('/', auth, async (req, res, next) => {
       if (isAdmin) {
         // 管理员购买：免费并直接视为已支付
         insertSql = `INSERT INTO orders
-         (user_id, plan_id, order_no, amount, pay_method, status, duration_days, created_at, paid_at)
-         VALUES (?, ?, ?, ?, ?, 'paid', ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`;
-        insertParams = [userId, plan_id, orderNo, 0, pay_method, durationDays];
+         (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, created_at, paid_at)
+         VALUES (?, ?, ?, ?, ?, 'paid', 'purchase', ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`;
+        insertParams = [userId, plan_id, orderNo, 0, pay_method, durationDays, trafficAmount];
       } else {
         insertSql = `INSERT INTO orders
-         (user_id, plan_id, order_no, amount, pay_method, status, duration_days, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())`;
-        insertParams = [userId, plan_id, orderNo, amount, pay_method, durationDays];
+         (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', 'purchase', ?, ?, UTC_TIMESTAMP())`;
+        insertParams = [userId, plan_id, orderNo, amount, pay_method, durationDays, trafficAmount];
       }
 
       const [result] = await connection.query(insertSql, insertParams);
 
-      // 如果是管理员购买（已支付），自动分配流量配额（一次性配额，无重置周期）
+      // 如果是管理员购买（已支付），累加流量并延长到期时间
       if (isAdmin) {
-        const trafficLimit = Number(plan.traffic_limit || 0);
-        if (trafficLimit > 0) {
+        if (trafficAmount > 0) {
           await connection.query(
             'UPDATE users SET traffic_total = traffic_total + ? WHERE id = ?',
-            [trafficLimit, userId]
+            [trafficAmount, userId]
           );
         }
+        await connection.query(
+          `UPDATE users SET
+            expired_at = CASE
+              WHEN expired_at IS NULL OR expired_at < NOW() THEN DATE_ADD(NOW(), INTERVAL ? DAY)
+              ELSE DATE_ADD(expired_at, INTERVAL ? DAY)
+            END
+           WHERE id = ?`,
+          [durationDays, durationDays, userId]
+        );
       }
 
       await connection.commit();

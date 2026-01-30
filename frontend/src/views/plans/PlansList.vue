@@ -165,7 +165,7 @@ const plansGrouped = computed(() => {
 const isAdmin = computed(() => userStore.user?.role === 'admin');
 
 function formatTraffic(bytes) {
-  if (!bytes || bytes === 0) return '0G(不可用)';
+  if (!bytes || bytes === 0) return '无流量';
   const gb = bytes / (1024 ** 3);
   return gb.toFixed(0) + ' GB';
 }

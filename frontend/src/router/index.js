@@ -13,6 +13,7 @@ import AdminPlans from '@/views/admin/AdminPlans.vue';
 import AdminOrders from '@/views/admin/AdminOrders.vue';
 import AdminTickets from '@/views/admin/AdminTickets.vue';
 import AdminNodes from '@/views/admin/AdminNodes.vue';
+import AdminSettings from '@/views/admin/AdminSettings.vue';
 import { useUserStore } from '@/store/user';
 
 const routes = [
@@ -107,6 +108,12 @@ const routes = [
         name: 'AdminNodes',
         component: AdminNodes,
         meta: { title: '节点管理', admin: true }
+      },
+      {
+        path: 'admin/settings',
+        name: 'AdminSettings',
+        component: AdminSettings,
+        meta: { title: '面板管理', admin: true }
       }
     ]
   }

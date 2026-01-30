@@ -5,23 +5,85 @@ const auth = require('../middleware/auth');
 
 const router = express.Router();
 
+// 从subscriptions表获取或创建UUID（与订阅token绑定）
+async function getOrCreateSubscriptionUuid(userId) {
+  const [rows] = await pool.query(
+    'SELECT uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  if (rows.length > 0 && rows[0].uuid) {
+    return rows[0].uuid;
+  }
+  // 如果没有UUID，生成新的并更新到subscriptions表
+  const uuid = crypto.randomUUID();
+  await pool.query(
+    'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
+    [uuid, userId]
+  );
+  return uuid;
+}
+
+// 兼容旧代码：从user_clients表获取UUID（如果subscriptions表中没有）
 async function getOrCreateUserUuid(userId) {
+  // 优先从subscriptions表获取
+  const [subRows] = await pool.query(
+    'SELECT uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  if (subRows.length > 0 && subRows[0].uuid) {
+    return subRows[0].uuid;
+  }
+  
+  // 如果subscriptions表中没有，从user_clients表获取
   const [rows] = await pool.query(
     'SELECT uuid FROM user_clients WHERE user_id = ? AND enabled = 1 ORDER BY id ASC LIMIT 1',
     [userId]
   );
   if (rows.length > 0) return rows[0].uuid;
+  
+  // 如果都没有，生成新的UUID
   const uuid = crypto.randomUUID();
-  await pool.query(
-    'INSERT INTO user_clients (user_id, uuid, remark, enabled) VALUES (?, ?, ?, 1)',
-    [userId, uuid, 'default']
+  // 先尝试更新到subscriptions表
+  const [subCheck] = await pool.query(
+    'SELECT id FROM subscriptions WHERE user_id = ? LIMIT 1',
+    [userId]
   );
+  if (subCheck.length > 0) {
+    await pool.query(
+      'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
+      [uuid, userId]
+    );
+  } else {
+    // 如果subscriptions表也没有记录，插入到user_clients表（兼容旧逻辑）
+    await pool.query(
+      'INSERT INTO user_clients (user_id, uuid, remark, enabled) VALUES (?, ?, ?, 1)',
+      [userId, uuid, 'default']
+    );
+  }
   return uuid;
 }
 
 // 生成随机 token
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+// 从 system_settings 读取面板网址（用于订阅 URL）
+async function getPanelPublicUrl(req) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT value FROM system_settings WHERE `key` = 'panel_public_url' LIMIT 1"
+    );
+    if (rows.length > 0 && rows[0].value) return String(rows[0].value).trim();
+  } catch (e) {
+    // 表可能不存在
+  }
+  if (process.env.PANEL_PUBLIC_URL) return String(process.env.PANEL_PUBLIC_URL).trim();
+  if (req && req.protocol && req.get) {
+    const host = req.get('host');
+    if (host) return `${req.protocol}://${host}`;
+  }
+  return '';
 }
 
 // GET /api/subscription/token 获取或生成用户的订阅 token
@@ -31,26 +93,41 @@ router.get('/token', auth, async (req, res, next) => {
 
     // 先查是否已有订阅 token
     let [rows] = await pool.query(
-      'SELECT token FROM subscriptions WHERE user_id = ? LIMIT 1',
+      'SELECT token, uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
       [userId]
     );
 
     let token;
+    let uuid;
     if (rows.length === 0) {
-      // 没有则生成新的
+      // 没有则生成新的token和UUID
       token = generateToken();
+      uuid = crypto.randomUUID();
       await pool.query(
-        'INSERT INTO subscriptions (user_id, token, created_at) VALUES (?, ?, NOW())',
-        [userId, token]
+        'INSERT INTO subscriptions (user_id, token, uuid, created_at) VALUES (?, ?, ?, NOW())',
+        [userId, token, uuid]
       );
     } else {
       token = rows[0].token;
+      uuid = rows[0].uuid;
+      // 如果UUID不存在，生成并更新
+      if (!uuid) {
+        uuid = crypto.randomUUID();
+        await pool.query(
+          'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
+          [uuid, userId]
+        );
+      }
     }
+
+    // 获取面板网址用于生成订阅链接
+    const panelUrl = await getPanelPublicUrl(req);
+    const shareUrl = panelUrl ? `${panelUrl.replace(/\/$/, '')}/api/sub/${token}` : '';
 
     res.json({
       code: 200,
       message: 'success',
-      data: { token }
+      data: { token, uuid, share_url: shareUrl }
     });
   } catch (err) {
     next(err);
@@ -62,16 +139,22 @@ router.post('/reset-token', auth, async (req, res, next) => {
   try {
     const userId = req.user.id;
     const newToken = generateToken();
+    // 重置token时同时生成新的UUID
+    const newUuid = crypto.randomUUID();
 
     await pool.query(
-      'UPDATE subscriptions SET token = ?, updated_at = NOW() WHERE user_id = ?',
-      [newToken, userId]
+      'UPDATE subscriptions SET token = ?, uuid = ?, updated_at = NOW() WHERE user_id = ?',
+      [newToken, newUuid, userId]
     );
+
+    // 获取面板网址用于生成订阅链接
+    const panelUrl = await getPanelPublicUrl(req);
+    const shareUrl = panelUrl ? `${panelUrl.replace(/\/$/, '')}/api/sub/${newToken}` : '';
 
     res.json({
       code: 200,
       message: '订阅链接已重置',
-      data: { token: newToken }
+      data: { token: newToken, uuid: newUuid, share_url: shareUrl }
     });
   } catch (err) {
     next(err);

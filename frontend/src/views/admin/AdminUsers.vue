@@ -29,8 +29,11 @@
         <template v-if="detailData">
           <n-descriptions :column="1" label-placement="left" label-width="120">
             <n-descriptions-item label="注册时间">{{ detailData.created_at ? formatDateTimeUtc8(detailData.created_at) : '-' }}</n-descriptions-item>
-            <n-descriptions-item label="当前套餐">{{ detailData.current_plan || '-' }}</n-descriptions-item>
-            <n-descriptions-item label="套餐激活时间">{{ detailData.plan_activated_at ? formatDateTimeUtc8(detailData.plan_activated_at) : '-' }}</n-descriptions-item>
+            <n-descriptions-item label="当前套餐">
+              {{ (detailData.current_plans && detailData.current_plans.length) ? detailData.current_plans.map(p => p.display).join('、') : '-' }}
+              <n-button v-if="detailData.id && (detailData.current_plans && detailData.current_plans.length)" type="warning" size="tiny" style="margin-left: 8px;" @click="openUnsubscribeModal(detailData)">退订</n-button>
+            </n-descriptions-item>
+            <n-descriptions-item label="当前套餐到期">{{ (detailData.current_plans && detailData.current_plans[0]) ? formatDateTimeUtc8(detailData.current_plans[0].expired_at) : '-' }}</n-descriptions-item>
             <n-descriptions-item label="账户余额">¥{{ detailData.balance ?? 0 }}</n-descriptions-item>
             <n-descriptions-item label="分享/订阅 URL">
               <template v-if="detailData.share_url">
@@ -106,11 +109,37 @@
         </n-space>
       </template>
     </n-modal>
+    <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订（扣减时长与流量）" style="width: 420px;">
+      <n-form ref="unsubFormRef" :model="unsubForm" label-placement="left" label-width="120px">
+        <n-alert v-if="unsubRemainingInfo" type="info" style="margin-bottom: 16px;">
+          <div>剩余天数：{{ unsubRemainingInfo.remaining_days }} 天</div>
+          <div>剩余流量：{{ unsubRemainingInfo.remaining_traffic_gb }} GB</div>
+        </n-alert>
+        <n-form-item label="全额退订">
+          <n-checkbox v-model:checked="unsubForm.full_refund">全额退订（将扣减所有剩余天数和流量，套餐将失效）</n-checkbox>
+        </n-form-item>
+        <n-form-item label="扣减天数">
+          <n-input-number v-model:value="unsubForm.duration_days_deduct" :min="0" :max="unsubRemainingInfo ? unsubRemainingInfo.remaining_days : undefined" :disabled="unsubForm.full_refund" style="width: 100%" placeholder="0 表示不扣减时长" />
+        </n-form-item>
+        <n-form-item label="扣减流量 (GB)">
+          <n-input-number v-model:value="unsubForm.traffic_gb_deduct" :min="0" :max="unsubRemainingInfo ? parseFloat(unsubRemainingInfo.remaining_traffic_gb) : undefined" :precision="2" :disabled="unsubForm.full_refund" style="width: 100%" placeholder="0 表示不扣减流量" />
+        </n-form-item>
+        <n-form-item label="备注">
+          <n-input v-model:value="unsubForm.remark" type="textarea" placeholder="选填，如：管理员退订" :rows="2" />
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showUnsubscribeModal = false">取消</n-button>
+          <n-button type="warning" :loading="unsubLoading" @click="submitUnsubscribe">确认退订</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </n-card>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, h } from 'vue';
+import { ref, computed, onMounted, watch, h } from 'vue';
 import {
   NCard,
   NSpace,
@@ -133,7 +162,7 @@ import {
   NText,
   useMessage
 } from 'naive-ui';
-import { getAdminUsers, getAdminUserDetail, patchAdminUser, deleteAdminUser } from '@/api/admin';
+import { getAdminUsers, getAdminUserDetail, getAdminUserRemaining, patchAdminUser, deleteAdminUser, postAdminUserUnsubscribe } from '@/api/admin';
 import { useUserStore } from '@/store/user';
 import { formatDateTimeUtc8 } from '@/utils/datetime';
 
@@ -301,6 +330,13 @@ const columns = [
 const showDetailDrawer = ref(false);
 const detailData = ref(null);
 
+const showUnsubscribeModal = ref(false);
+const unsubForm = ref({ duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '', full_refund: false });
+const unsubFormRef = ref(null);
+const unsubLoading = ref(false);
+const unsubRemainingInfo = ref(null);
+let unsubUserId = null;
+
 const showEditModal = ref(false);
 const editForm = ref({
   id: null,
@@ -325,6 +361,64 @@ async function openDetail(row) {
 function copyShareUrl(url) {
   if (!url) return;
   navigator.clipboard.writeText(url).then(() => message.success('已复制到剪贴板')).catch(() => message.error('复制失败'));
+}
+
+async function openUnsubscribeModal(user) {
+  unsubUserId = user.id;
+  unsubForm.value = { duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '', full_refund: false };
+  unsubRemainingInfo.value = null;
+  try {
+    const res = await getAdminUserRemaining(user.id);
+    unsubRemainingInfo.value = res.data || null;
+    if (!unsubRemainingInfo.value || !unsubRemainingInfo.value.can_unsubscribe) {
+      message.warning('该用户当前没有可退订的套餐');
+      return;
+    }
+  } catch (e) {
+    message.error(e.message || '获取剩余信息失败');
+    return;
+  }
+  showUnsubscribeModal.value = true;
+}
+
+// 监听全额退订复选框，自动填入剩余天数和流量
+watch(() => unsubForm.value.full_refund, (checked) => {
+  if (checked && unsubRemainingInfo.value) {
+    unsubForm.value.duration_days_deduct = unsubRemainingInfo.value.remaining_days || 0;
+    unsubForm.value.traffic_gb_deduct = parseFloat(unsubRemainingInfo.value.remaining_traffic_gb || 0);
+  } else if (!checked) {
+    unsubForm.value.duration_days_deduct = 0;
+    unsubForm.value.traffic_gb_deduct = 0;
+  }
+});
+
+async function submitUnsubscribe() {
+  const d = Number(unsubForm.value.duration_days_deduct) || 0;
+  const g = Number(unsubForm.value.traffic_gb_deduct) || 0;
+  if (!unsubForm.value.full_refund && d <= 0 && g <= 0) {
+    message.warning('请填写扣减天数或扣减流量至少一项，或选择全额退订');
+    return;
+  }
+  unsubLoading.value = true;
+  try {
+    const res = await postAdminUserUnsubscribe(unsubUserId, {
+      duration_days_deduct: d,
+      traffic_gb_deduct: g,
+      remark: (unsubForm.value.remark || '').trim(),
+      full_refund: unsubForm.value.full_refund
+    });
+    message.success(res.data?.removed_from_plan ? '全额退订已生效，套餐已失效' : '退订已生效');
+    showUnsubscribeModal.value = false;
+    if (detailData.value && detailData.value.id === unsubUserId) {
+      const res = await getAdminUserDetail(unsubUserId);
+      detailData.value = res.data || null;
+    }
+    await fetchList();
+  } catch (e) {
+    message.error(e.response?.data?.message || e.message || '退订失败');
+  } finally {
+    unsubLoading.value = false;
+  }
 }
 
 async function fetchList() {

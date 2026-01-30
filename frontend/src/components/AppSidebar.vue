@@ -42,7 +42,8 @@ const adminMenuOptions = [
   { label: '套餐管理', key: '/admin/plans' },
   { label: '订单管理', key: '/admin/orders' },
   { label: '工单管理', key: '/admin/tickets' },
-  { label: '节点管理', key: '/admin/nodes' }
+  { label: '节点管理', key: '/admin/nodes' },
+  { label: '面板管理', key: '/admin/settings' }
 ];
 
 const menuOptions = computed(() => {

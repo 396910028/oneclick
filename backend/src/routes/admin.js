@@ -140,19 +140,37 @@ router.get('/users/:id', async (req, res, next) => {
 
     const user = userRows[0];
 
+    // 从subscriptions表获取UUID（与订阅token绑定）
+    let share_url = null;
+    let userUuid = null;
+    const [subRows] = await pool.query(
+      'SELECT token, uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+      [userId]
+    );
+    if (subRows.length > 0 && subRows[0].token) {
+      userUuid = subRows[0].uuid || null;
+      const baseUrl = await getPanelPublicUrl(req);
+      if (baseUrl) {
+        share_url = `${baseUrl.replace(/\/$/, '')}/api/sub/${subRows[0].token}`;
+      }
+    }
+    
+    // 如果没有UUID，也从user_clients表获取（兼容旧数据）
     const [uuidRows] = await pool.query(
       'SELECT uuid, remark, enabled, created_at FROM user_clients WHERE user_id = ? ORDER BY id ASC',
       [userId]
     );
-
-    let share_url = null;
-    const [subRows] = await pool.query(
-      'SELECT token FROM subscriptions WHERE user_id = ? LIMIT 1',
-      [userId]
-    );
-    if (subRows.length > 0 && subRows[0].token) {
-      const baseUrl = (await getPanelPublicUrl(req)) || `${req.protocol || 'http'}://${req.get('host') || ''}`;
-      share_url = `${baseUrl.replace(/\/$/, '')}/api/sub/${subRows[0].token}`;
+    
+    // 优先使用subscriptions表中的UUID
+    const uuids = [];
+    if (userUuid) {
+      uuids.push({ uuid: userUuid, remark: '订阅UUID', enabled: true });
+    }
+    // 补充user_clients中的UUID（如果存在且不同）
+    for (const r of uuidRows) {
+      if (r.uuid !== userUuid) {
+        uuids.push({ uuid: r.uuid, remark: r.remark || '客户端UUID', enabled: !!r.enabled });
+      }
     }
 
     const [orderRows] = await pool.query(
@@ -167,19 +185,26 @@ router.get('/users/:id', async (req, res, next) => {
     );
 
     const now = new Date();
+    // 检查用户的expired_at，如果已过期则不应显示当前套餐
+    const userExpiredAt = user.expired_at ? new Date(user.expired_at) : null;
+    const isUserExpired = userExpiredAt && userExpiredAt <= now;
+    
     const currentPlans = [];
-    for (const o of orderRows) {
-      const paidAt = o.paid_at ? new Date(o.paid_at) : null;
-      const durationDays = Number(o.duration_days || 0);
-      if (!paidAt || durationDays <= 0) continue;
-      const expire = new Date(paidAt.getTime() + durationDays * 24 * 60 * 60 * 1000);
-      if (expire > now) {
-        currentPlans.push({
-          plan_name: o.plan_name,
-          group_name: o.group_name,
-          display: o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name,
-          expired_at: expire.toISOString ? expire.toISOString().slice(0, 19) : expire
-        });
+    // 如果用户已过期，不显示任何当前套餐
+    if (!isUserExpired) {
+      for (const o of orderRows) {
+        const paidAt = o.paid_at ? new Date(o.paid_at) : null;
+        const durationDays = Number(o.duration_days || 0);
+        if (!paidAt || durationDays <= 0) continue;
+        const expire = new Date(paidAt.getTime() + durationDays * 24 * 60 * 60 * 1000);
+        if (expire > now) {
+          currentPlans.push({
+            plan_name: o.plan_name,
+            group_name: o.group_name,
+            display: o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name,
+            expired_at: expire.toISOString ? expire.toISOString().slice(0, 19) : expire
+          });
+        }
       }
     }
 
@@ -198,7 +223,7 @@ router.get('/users/:id', async (req, res, next) => {
         expired_at: user.expired_at,
         created_at: user.created_at,
         current_plans: currentPlans,
-        uuids: uuidRows.map((r) => ({ uuid: r.uuid, remark: r.remark, enabled: !!r.enabled })),
+        uuids: uuids,
         share_url
       }
     });
@@ -277,6 +302,230 @@ router.patch('/users/:id', async (req, res, next) => {
   }
 });
 
+// GET /api/admin/users/:id/remaining 获取用户剩余天数和流量（用于退订）
+router.get('/users/:id/remaining', async (req, res, next) => {
+  try {
+    const userId = Number(req.params.id);
+    if (!userId) {
+      return res.status(400).json({ code: 400, message: '用户 id 无效', data: null });
+    }
+
+    // 获取用户当前所有已支付订单（购买和退订）
+    const [orderRows] = await pool.query(
+      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
+              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
+       FROM orders o
+       JOIN plans p ON o.plan_id = p.id
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
+       ORDER BY o.paid_at ASC, o.id ASC`,
+      [userId]
+    );
+
+    if (orderRows.length === 0) {
+      return res.json({
+        code: 200,
+        message: 'success',
+        data: {
+          remaining_days: 0,
+          remaining_traffic_bytes: 0,
+          remaining_traffic_gb: '0.00',
+          current_plan: null,
+          can_unsubscribe: false
+        }
+      });
+    }
+
+    // 计算剩余天数和流量
+    const [userRows] = await pool.query(
+      'SELECT traffic_total, traffic_used, expired_at FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const user = userRows[0];
+    const userTrafficTotal = Number(user.traffic_total || 0);
+    const userTrafficUsed = Number(user.traffic_used || 0);
+    const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
+
+    // 计算剩余天数（从最早订单开始累加）
+    let totalDays = 0;
+    let earliestPaidAt = null;
+    for (const o of orderRows) {
+      const paidAt = new Date(o.paid_at);
+      if (!earliestPaidAt || paidAt < earliestPaidAt) {
+        earliestPaidAt = paidAt;
+      }
+      totalDays += Number(o.duration_days || 0);
+    }
+    const now = new Date();
+    const expireAt = earliestPaidAt ? new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000) : null;
+    const remainingDays = expireAt && expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+
+    res.json({
+      code: 200,
+      message: 'success',
+      data: {
+        remaining_days: remainingDays,
+        remaining_traffic_bytes: remainingTraffic,
+        remaining_traffic_gb: (remainingTraffic / (1024 ** 3)).toFixed(2),
+        current_plan: orderRows.length > 0 ? {
+          group_id: orderRows[0].group_id,
+          group_name: orderRows[0].group_name,
+          plan_name: orderRows[0].plan_name
+        } : null,
+        can_unsubscribe: remainingDays > 0 || remainingTraffic > 0
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/users/:id/unsubscribe 退订：扣减该用户时长与流量（写入一条负值订单并更新用户）
+router.post('/users/:id/unsubscribe', async (req, res, next) => {
+  const connection = await pool.getConnection();
+  try {
+    const userId = Number(req.params.id);
+    const { plan_id, duration_days_deduct = 0, traffic_gb_deduct = 0, remark = '', full_refund = false } = req.body;
+
+    if (!userId) {
+      connection.release();
+      return res.status(400).json({ code: 400, message: '用户 id 无效', data: null });
+    }
+
+    const daysDeduct = Math.max(0, Number(duration_days_deduct) || 0);
+    const gbDeduct = Math.max(0, Number(traffic_gb_deduct) || 0);
+    const trafficBytesDeduct = Math.round(gbDeduct * 1073741824);
+
+    if (!full_refund && daysDeduct <= 0 && trafficBytesDeduct <= 0) {
+      connection.release();
+      return res.status(400).json({
+        code: 400,
+        message: '请填写扣减天数或扣减流量（GB）至少一项，或选择全额退订',
+        data: null
+      });
+    }
+
+    // 获取用户当前套餐剩余
+    const [orderRows] = await connection.query(
+      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
+              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
+       FROM orders o
+       JOIN plans p ON o.plan_id = p.id
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
+       ORDER BY o.paid_at ASC, o.id ASC`,
+      [userId]
+    );
+
+    if (orderRows.length === 0) {
+      connection.release();
+      return res.status(400).json({
+        code: 400,
+        message: '该用户当前没有生效的套餐',
+        data: null
+      });
+    }
+
+    // 计算剩余天数和流量
+    const [userRows] = await connection.query(
+      'SELECT traffic_total, traffic_used, expired_at FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const user = userRows[0];
+    const userTrafficTotal = Number(user.traffic_total || 0);
+    const userTrafficUsed = Number(user.traffic_used || 0);
+    const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
+
+    // 计算剩余天数（从最早订单开始累加）
+    let totalDays = 0;
+    let earliestPaidAt = null;
+    for (const o of orderRows) {
+      const paidAt = new Date(o.paid_at);
+      if (!earliestPaidAt || paidAt < earliestPaidAt) {
+        earliestPaidAt = paidAt;
+      }
+      totalDays += Number(o.duration_days || 0);
+    }
+    const now = new Date();
+    const expireAt = earliestPaidAt ? new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000) : null;
+    const remainingDays = expireAt && expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+
+    let finalDaysDeduct = daysDeduct;
+    let finalTrafficDeduct = trafficBytesDeduct;
+
+    if (full_refund) {
+      finalDaysDeduct = remainingDays;
+      finalTrafficDeduct = remainingTraffic;
+    } else {
+      // 检查是否超限
+      if (finalDaysDeduct > remainingDays) {
+        connection.release();
+        return res.status(400).json({
+          code: 400,
+          message: `扣减天数（${finalDaysDeduct}）超过剩余天数（${remainingDays}），无法退订`,
+          data: null
+        });
+      }
+      if (finalTrafficDeduct > remainingTraffic) {
+        connection.release();
+        return res.status(400).json({
+          code: 400,
+          message: `扣减流量（${(finalTrafficDeduct / (1024 ** 3)).toFixed(2)} GB）超过剩余流量（${(remainingTraffic / (1024 ** 3)).toFixed(2)} GB），无法退订`,
+          data: null
+        });
+      }
+    }
+
+    await connection.beginTransaction();
+
+    const planId = plan_id ? Number(plan_id) : orderRows[0].plan_id;
+    const orderNo = `UNSUB${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+    await connection.query(
+      `INSERT INTO orders
+       (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, remark, created_at, paid_at)
+       VALUES (?, ?, ?, 0, 'balance', 'paid', 'unsubscribe', ?, ?, ?, NOW(), NOW())`,
+      [userId, planId, orderNo, -finalDaysDeduct, -finalTrafficDeduct, (remark || '').slice(0, 255)]
+    );
+
+    // 扣减流量（不退订时不改变到期时间）
+    if (finalTrafficDeduct > 0) {
+      await connection.query(
+        'UPDATE users SET traffic_total = GREATEST(0, traffic_total - ?) WHERE id = ?',
+        [finalTrafficDeduct, userId]
+      );
+    }
+
+    // 检查是否全额退订或超限，如果是则剔出套餐（设置 expired_at 为当前时间）
+    const shouldRemovePlan = full_refund || finalDaysDeduct >= remainingDays || finalTrafficDeduct >= remainingTraffic;
+    if (shouldRemovePlan) {
+      await connection.query(
+        'UPDATE users SET expired_at = NOW() WHERE id = ?',
+        [userId]
+      );
+    }
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      code: 200,
+      message: shouldRemovePlan ? '全额退订已生效，套餐已失效' : '退订已生效，已扣减流量',
+      data: {
+        order_no: orderNo,
+        removed_from_plan: shouldRemovePlan
+      }
+    });
+  } catch (err) {
+    try {
+      await connection.rollback();
+    } catch (e) {
+      // ignore
+    }
+    connection.release();
+    next(err);
+  }
+});
+
 // DELETE /api/admin/users/:id 删除用户（不能删除自己；会级联删除其订单、工单等）
 router.delete('/users/:id', async (req, res, next) => {
   try {
@@ -328,6 +577,8 @@ router.get('/plan-groups', async (req, res, next) => {
               status,
               is_public,
               sort_order,
+              connections,
+              speed_limit,
               created_at,
               updated_at
        FROM plan_groups
@@ -353,7 +604,9 @@ router.post('/plan-groups', async (req, res, next) => {
       level = 0,
       is_exclusive = 0,
       status = 1,
-      is_public = 1
+      is_public = 1,
+      connections = 1,
+      speed_limit = 0
     } = req.body;
 
     if (!group_key || !name) {
@@ -373,17 +626,21 @@ router.post('/plan-groups', async (req, res, next) => {
       });
     }
 
+    const connNum = Number(connections);
+    const speedNum = Number(speed_limit);
     const [result] = await pool.query(
       `INSERT INTO plan_groups
-       (group_key, name, level, is_exclusive, status, is_public, sort_order, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, NOW())`,
+       (group_key, name, level, is_exclusive, status, is_public, sort_order, connections, speed_limit, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NOW())`,
       [
         group_key,
         name,
         levelNum,
         is_exclusive ? 1 : 0,
         status,
-        is_public ? 1 : 0
+        is_public ? 1 : 0,
+        Number.isNaN(connNum) ? 1 : Math.max(1, connNum),
+        Number.isNaN(speedNum) ? 0 : Math.max(0, speedNum)
       ]
     );
 
@@ -408,7 +665,7 @@ router.post('/plan-groups', async (req, res, next) => {
 router.put('/plan-groups/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const allowedFields = ['group_key', 'name', 'level', 'is_exclusive', 'status', 'is_public'];
+    const allowedFields = ['group_key', 'name', 'level', 'is_exclusive', 'status', 'is_public', 'connections', 'speed_limit'];
 
     const fields = [];
     const params = [];
@@ -516,7 +773,7 @@ router.get('/plans', async (req, res, next) => {
   }
 });
 
-// POST /api/admin/plans 新增子套餐
+// POST /api/admin/plans 新增子套餐（仅价格、时长、流量；共享设备与限速从总套餐继承）
 router.post('/plans', async (req, res, next) => {
   try {
     const {
@@ -526,8 +783,6 @@ router.post('/plans', async (req, res, next) => {
       price,
       duration_days = 30,
       traffic_limit = 0,
-      speed_limit = 0,
-      connections = 1,
       is_public = 1,
       status = 1
     } = req.body;
@@ -540,9 +795,9 @@ router.post('/plans', async (req, res, next) => {
       });
     }
 
-    // 验证总套餐是否存在
+    // 验证总套餐是否存在，并读取共享设备、限速（子套餐继承总套餐）
     const [groupRows] = await pool.query(
-      'SELECT id, level, is_exclusive, status FROM plan_groups WHERE id = ? LIMIT 1',
+      'SELECT id, level, is_exclusive, status, COALESCE(connections, 1) AS connections, COALESCE(speed_limit, 0) AS speed_limit FROM plan_groups WHERE id = ? LIMIT 1',
       [group_id]
     );
 
@@ -581,6 +836,10 @@ router.post('/plans', async (req, res, next) => {
       });
     }
 
+    // 子套餐的共享设备、限速从总套餐继承，不再单独传
+    const connFromGroup = Number(group.connections) || 1;
+    const speedFromGroup = Number(group.speed_limit) || 0;
+
     const [result] = await pool.query(
       `INSERT INTO plans
        (group_id, name, description, price, duration_days,
@@ -593,9 +852,9 @@ router.post('/plans', async (req, res, next) => {
         description,
         priceNum,
         durationNum,
-        traffic_limit,
-        speed_limit,
-        connections,
+        traffic_limit ?? 0,
+        speedFromGroup,
+        connFromGroup,
         is_public,
         status
       ]
@@ -611,7 +870,7 @@ router.post('/plans', async (req, res, next) => {
   }
 });
 
-// PUT /api/admin/plans/:id 更新子套餐
+// PUT /api/admin/plans/:id 更新子套餐（仅价格、时长、流量可编辑；共享设备与限速随总套餐）
 router.put('/plans/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -622,8 +881,6 @@ router.put('/plans/:id', async (req, res, next) => {
       'price',
       'duration_days',
       'traffic_limit',
-      'speed_limit',
-      'connections',
       'is_public',
       'status'
     ];
@@ -646,11 +903,12 @@ router.put('/plans/:id', async (req, res, next) => {
       });
     }
 
-    // 如果更新了 group_id，验证新总套餐是否存在且启用
-    if (req.body.group_id !== undefined) {
+    const groupIdToSync = req.body.group_id !== undefined ? req.body.group_id : null;
+    // 如果更新了 group_id，验证新总套餐并同步共享设备、限速
+    if (groupIdToSync !== null) {
       const [groupRows] = await pool.query(
-        'SELECT id, status FROM plan_groups WHERE id = ? LIMIT 1',
-        [req.body.group_id]
+        'SELECT id, status, COALESCE(connections, 1) AS connections, COALESCE(speed_limit, 0) AS speed_limit FROM plan_groups WHERE id = ? LIMIT 1',
+        [groupIdToSync]
       );
       if (groupRows.length === 0) {
         return res.status(404).json({
@@ -666,6 +924,8 @@ router.put('/plans/:id', async (req, res, next) => {
           data: null
         });
       }
+      fields.push('connections = ?', 'speed_limit = ?');
+      params.push(Number(groupRows[0].connections) || 1, Number(groupRows[0].speed_limit) || 0);
     }
 
     params.push(id);
@@ -748,7 +1008,10 @@ router.get('/orders', async (req, res, next) => {
               o.amount,
               o.status,
               o.pay_method,
+              o.order_type,
               o.duration_days,
+              o.traffic_amount,
+              o.remark,
               o.created_at,
               o.paid_at,
               DATE_ADD(o.created_at, INTERVAL 30 MINUTE) AS pay_expire_at,
@@ -820,30 +1083,40 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
       });
     }
 
-    // 查询套餐的流量配额
+    // 查询套餐的流量与时长
     const [planRows] = await connection.query(
-      'SELECT traffic_limit FROM plans WHERE id = ? LIMIT 1',
+      'SELECT traffic_limit, duration_days FROM plans WHERE id = ? LIMIT 1',
       [order.plan_id]
     );
+    const trafficLimit = planRows.length > 0 ? Number(planRows[0].traffic_limit || 0) : 0;
+    const durationDays = planRows.length > 0 ? Number(planRows[0].duration_days || 0) : 0;
 
-    // 更新订单状态
+    // 更新订单状态并写入流量（便于列表展示）
     await connection.query(
       `UPDATE orders
        SET status = 'paid',
-           paid_at = NOW()
+           paid_at = NOW(),
+           traffic_amount = ?
        WHERE id = ?`,
-      [id]
+      [trafficLimit, id]
     );
 
-    // 如果套餐有流量配额，累加到用户的 traffic_total（一次性配额，无重置周期）
-    if (planRows.length > 0) {
-      const trafficLimit = Number(planRows[0].traffic_limit || 0);
-      if (trafficLimit > 0) {
-        await connection.query(
-          'UPDATE users SET traffic_total = traffic_total + ? WHERE id = ?',
-          [trafficLimit, order.user_id]
-        );
-      }
+    if (trafficLimit > 0) {
+      await connection.query(
+        'UPDATE users SET traffic_total = traffic_total + ? WHERE id = ?',
+        [trafficLimit, order.user_id]
+      );
+    }
+    if (durationDays > 0) {
+      await connection.query(
+        `UPDATE users SET
+          expired_at = CASE
+            WHEN expired_at IS NULL OR expired_at < NOW() THEN DATE_ADD(NOW(), INTERVAL ? DAY)
+            ELSE DATE_ADD(expired_at, INTERVAL ? DAY)
+          END
+         WHERE id = ?`,
+        [durationDays, durationDays, order.user_id]
+      );
     }
 
     await connection.commit();
@@ -1151,6 +1424,55 @@ router.post('/settings/internal-api-key', (req, res) => {
     message: 'INTERNAL_API_KEY 已更新（当前进程生效，重启后需再次设置或更新 .env.docker）',
     data: { value }
   });
+});
+
+// GET /api/admin/settings/panel 获取面板设置（面板网址）
+router.get('/settings/panel', async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT value FROM system_settings WHERE `key` = 'panel_public_url' LIMIT 1"
+    );
+    const panelUrl = rows.length > 0 && rows[0].value ? String(rows[0].value).trim() : '';
+    res.json({
+      code: 200,
+      message: 'success',
+      data: { panel_public_url: panelUrl }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/admin/settings/panel 更新面板设置（面板网址）
+router.put('/settings/panel', async (req, res, next) => {
+  try {
+    const { panel_public_url } = req.body || {};
+    const url = panel_public_url ? String(panel_public_url).trim() : '';
+    
+    // 验证URL格式（简单验证）
+    if (url && !/^https?:\/\/.+/.test(url)) {
+      return res.status(400).json({
+        code: 400,
+        message: '面板网址格式不正确，应为 http:// 或 https:// 开头',
+        data: null
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO system_settings (\`key\`, \`value\`, updated_at)
+       VALUES ('panel_public_url', ?, NOW())
+       ON DUPLICATE KEY UPDATE \`value\` = ?, updated_at = NOW()`,
+      [url, url]
+    );
+
+    res.json({
+      code: 200,
+      message: '面板设置已更新',
+      data: { panel_public_url: url }
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 /* ========================
