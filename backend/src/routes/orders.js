@@ -59,6 +59,24 @@ router.get('/current', auth, async (req, res, next) => {
   try {
     const userId = req.user.id;
 
+    // 先检查用户是否已过期
+    const [userRows] = await pool.query(
+      'SELECT expired_at FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    if (userRows.length > 0) {
+      const userExpiredAt = userRows[0].expired_at ? new Date(userRows[0].expired_at) : null;
+      const now = new Date();
+      // 如果用户已过期，直接返回null
+      if (userExpiredAt && userExpiredAt <= now) {
+        return res.json({
+          code: 200,
+          message: 'success',
+          data: { current: null }
+        });
+      }
+    }
+
     const [rows] = await pool.query(
       `SELECT o.id,
               o.order_no,

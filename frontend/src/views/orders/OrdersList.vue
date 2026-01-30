@@ -15,18 +15,21 @@
     />
     <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订" style="width: 420px;">
       <n-form ref="unsubFormRef" :model="unsubForm" label-placement="left" label-width="120px">
-        <n-form-item label="全额退订">
-          <n-checkbox v-model:checked="unsubForm.full_refund">全额退订（将扣减所有剩余天数和流量，套餐将失效）</n-checkbox>
-        </n-form-item>
         <n-alert v-if="remainingInfo" type="info" style="margin-bottom: 16px;">
           <div>剩余天数：{{ remainingInfo.remaining_days }} 天</div>
           <div>剩余流量：{{ remainingInfo.remaining_traffic_gb }} GB</div>
         </n-alert>
+        <n-form-item label="退订方式">
+          <n-radio-group v-model:value="unsubForm.refund_type">
+            <n-radio value="full">全额退订（将扣减所有剩余天数和流量，套餐将失效）</n-radio>
+            <n-radio value="partial">部分退订</n-radio>
+          </n-radio-group>
+        </n-form-item>
         <n-form-item label="扣减天数">
-          <n-input-number v-model:value="unsubForm.duration_days_deduct" :min="0" :max="remainingInfo ? remainingInfo.remaining_days : undefined" :disabled="unsubForm.full_refund" style="width: 100%" placeholder="0 表示不扣减时长" />
+          <n-input-number v-model:value="unsubForm.duration_days_deduct" :min="0" :max="remainingInfo ? remainingInfo.remaining_days : undefined" :disabled="unsubForm.refund_type === 'full'" style="width: 100%" placeholder="0 表示不扣减时长" />
         </n-form-item>
         <n-form-item label="扣减流量 (GB)">
-          <n-input-number v-model:value="unsubForm.traffic_gb_deduct" :min="0" :max="remainingInfo ? parseFloat(remainingInfo.remaining_traffic_gb) : undefined" :precision="2" :disabled="unsubForm.full_refund" style="width: 100%" placeholder="0 表示不扣减流量" />
+          <n-input-number v-model:value="unsubForm.traffic_gb_deduct" :min="0" :max="remainingInfo ? parseFloat(remainingInfo.remaining_traffic_gb) : undefined" :precision="2" :disabled="unsubForm.refund_type === 'full'" style="width: 100%" placeholder="0 表示不扣减流量" />
         </n-form-item>
         <n-form-item label="备注">
           <n-input v-model:value="unsubForm.remark" type="textarea" placeholder="选填" :rows="2" />
@@ -44,7 +47,7 @@
 
 <script setup>
 import { ref, computed, onMounted, watch, h } from 'vue';
-import { NCard, NDataTable, NPagination, NTag, NButton, NPopconfirm, NModal, NForm, NFormItem, NInputNumber, NInput, NCheckbox, useMessage } from 'naive-ui';
+import { NCard, NDataTable, NPagination, NTag, NButton, NPopconfirm, NModal, NForm, NFormItem, NInputNumber, NInput, NRadioGroup, NRadio, useMessage } from 'naive-ui';
 import { getOrders, cancelOrder, getOrderRemaining, unsubscribeOrder } from '@/api/orders';
 import { formatDateTimeUtc8 } from '@/utils/datetime';
 
@@ -260,7 +263,7 @@ async function openUnsubscribeModal() {
       duration_days_deduct: 0,
       traffic_gb_deduct: 0,
       remark: '',
-      full_refund: false
+      refund_type: 'partial'
     };
     showUnsubscribeModal.value = true;
   } catch (e) {
@@ -268,12 +271,12 @@ async function openUnsubscribeModal() {
   }
 }
 
-// 监听全额退订复选框，自动填入剩余天数和流量
-watch(() => unsubForm.value.full_refund, (checked) => {
-  if (checked && remainingInfo.value) {
+// 监听退订方式，全额退订时自动填入剩余天数和流量
+watch(() => unsubForm.value.refund_type, (type) => {
+  if (type === 'full' && remainingInfo.value) {
     unsubForm.value.duration_days_deduct = remainingInfo.value.remaining_days || 0;
     unsubForm.value.traffic_gb_deduct = parseFloat(remainingInfo.value.remaining_traffic_gb || 0);
-  } else if (!checked) {
+  } else if (type === 'partial') {
     unsubForm.value.duration_days_deduct = 0;
     unsubForm.value.traffic_gb_deduct = 0;
   }
@@ -282,7 +285,8 @@ watch(() => unsubForm.value.full_refund, (checked) => {
 async function submitUnsubscribe() {
   const d = Number(unsubForm.value.duration_days_deduct) || 0;
   const g = Number(unsubForm.value.traffic_gb_deduct) || 0;
-  if (!unsubForm.value.full_refund && d <= 0 && g <= 0) {
+  const isFullRefund = unsubForm.value.refund_type === 'full';
+  if (!isFullRefund && d <= 0 && g <= 0) {
     message.warning('请填写扣减天数或扣减流量至少一项，或选择全额退订');
     return;
   }
@@ -292,7 +296,7 @@ async function submitUnsubscribe() {
       duration_days_deduct: d,
       traffic_gb_deduct: g,
       remark: (unsubForm.value.remark || '').trim(),
-      full_refund: unsubForm.value.full_refund
+      full_refund: isFullRefund
     });
     message.success(res.data?.removed_from_plan ? '全额退订已生效，套餐已失效' : '退订已生效');
     showUnsubscribeModal.value = false;

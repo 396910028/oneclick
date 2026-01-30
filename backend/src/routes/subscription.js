@@ -91,32 +91,70 @@ router.get('/token', auth, async (req, res, next) => {
   try {
     const userId = req.user.id;
 
-    // 先查是否已有订阅 token
+    // 先查是否已有订阅 token（先只查询token，兼容uuid字段不存在的情况）
     let [rows] = await pool.query(
-      'SELECT token, uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+      'SELECT token FROM subscriptions WHERE user_id = ? LIMIT 1',
       [userId]
     );
 
     let token;
-    let uuid;
+    let uuid = null;
     if (rows.length === 0) {
-      // 没有则生成新的token和UUID
+      // 没有则生成新的token
       token = generateToken();
-      uuid = crypto.randomUUID();
-      await pool.query(
-        'INSERT INTO subscriptions (user_id, token, uuid, created_at) VALUES (?, ?, ?, NOW())',
-        [userId, token, uuid]
-      );
-    } else {
-      token = rows[0].token;
-      uuid = rows[0].uuid;
-      // 如果UUID不存在，生成并更新
-      if (!uuid) {
+      try {
+        // 尝试插入uuid字段（如果字段存在）
         uuid = crypto.randomUUID();
         await pool.query(
-          'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
-          [uuid, userId]
+          'INSERT INTO subscriptions (user_id, token, uuid, created_at) VALUES (?, ?, ?, NOW())',
+          [userId, token, uuid]
         );
+      } catch (insertErr) {
+        // 如果uuid字段不存在，只插入token
+        if (insertErr.code === 'ER_BAD_FIELD_ERROR' || insertErr.message && insertErr.message.includes('uuid')) {
+          await pool.query(
+            'INSERT INTO subscriptions (user_id, token, created_at) VALUES (?, ?, NOW())',
+            [userId, token]
+          );
+        } else {
+          throw insertErr;
+        }
+      }
+    } else {
+      token = rows[0].token;
+      // 尝试读取uuid字段（如果字段存在）
+      try {
+        const [uuidRows] = await pool.query(
+          'SELECT uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+        if (uuidRows.length > 0) {
+          uuid = uuidRows[0].uuid || null;
+          // 如果UUID不存在，生成并更新
+          if (!uuid) {
+            uuid = crypto.randomUUID();
+            try {
+              await pool.query(
+                'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
+                [uuid, userId]
+              );
+            } catch (updateErr) {
+              // 如果uuid字段不存在，忽略更新
+              if (updateErr.code === 'ER_BAD_FIELD_ERROR' || updateErr.message && updateErr.message.includes('uuid')) {
+                uuid = null;
+              } else {
+                throw updateErr;
+              }
+            }
+          }
+        }
+      } catch (readErr) {
+        // 如果uuid字段不存在，忽略
+        if (readErr.code === 'ER_BAD_FIELD_ERROR' || readErr.message && readErr.message.includes('uuid')) {
+          uuid = null;
+        } else {
+          throw readErr;
+        }
       }
     }
 
@@ -142,10 +180,23 @@ router.post('/reset-token', auth, async (req, res, next) => {
     // 重置token时同时生成新的UUID
     const newUuid = crypto.randomUUID();
 
-    await pool.query(
-      'UPDATE subscriptions SET token = ?, uuid = ?, updated_at = NOW() WHERE user_id = ?',
-      [newToken, newUuid, userId]
-    );
+    try {
+      // 尝试更新uuid字段（如果字段存在）
+      await pool.query(
+        'UPDATE subscriptions SET token = ?, uuid = ?, updated_at = NOW() WHERE user_id = ?',
+        [newToken, newUuid, userId]
+      );
+    } catch (updateErr) {
+      // 如果uuid字段不存在，只更新token
+      if (updateErr.code === 'ER_BAD_FIELD_ERROR' || updateErr.message && updateErr.message.includes('uuid')) {
+        await pool.query(
+          'UPDATE subscriptions SET token = ?, updated_at = NOW() WHERE user_id = ?',
+          [newToken, userId]
+        );
+      } else {
+        throw updateErr;
+      }
+    }
 
     // 获取面板网址用于生成订阅链接
     const panelUrl = await getPanelPublicUrl(req);
@@ -167,9 +218,9 @@ router.get('/:token', async (req, res, next) => {
     const { token } = req.params;
     const format = req.query.format || 'clash'; // 默认 Clash
 
-    // 根据 token 查找用户
+    // 根据 token 查找用户（先不查询uuid，兼容字段不存在的情况）
     const [subRows] = await pool.query(
-      `SELECT s.user_id, u.status, u.traffic_used
+      `SELECT s.user_id, u.status, u.traffic_used, u.expired_at
        FROM subscriptions s
        JOIN users u ON s.user_id = u.id
        WHERE s.token = ? LIMIT 1`,
@@ -189,6 +240,53 @@ router.get('/:token', async (req, res, next) => {
     // 检查用户状态
     if (user.status !== 'active') {
       return res.status(403).send('# 账户已被停用');
+    }
+
+    // 检查用户是否已过期（expired_at <= NOW()）
+    if (user.expired_at) {
+      const expiredAt = new Date(user.expired_at);
+      if (expiredAt <= new Date()) {
+        return res.status(403).send('# 订阅已过期');
+      }
+    }
+
+    // 获取UUID：优先使用subscriptions表中的UUID
+    let userUuid = null;
+    try {
+      // 尝试从subscriptions表读取uuid字段
+      const [uuidRows] = await pool.query(
+        'SELECT uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+        [user.user_id]
+      );
+      if (uuidRows.length > 0 && uuidRows[0].uuid) {
+        userUuid = uuidRows[0].uuid;
+      }
+    } catch (readErr) {
+      // 如果uuid字段不存在，忽略错误
+      if (readErr.code === 'ER_BAD_FIELD_ERROR' || readErr.message && readErr.message.includes('uuid')) {
+        // 字段不存在，继续使用旧逻辑
+      } else {
+        throw readErr;
+      }
+    }
+    
+    if (!userUuid) {
+      // 如果subscriptions表中没有UUID，从user_clients表获取（兼容旧数据）
+      userUuid = await getOrCreateUserUuid(user.user_id);
+      // 尝试更新到subscriptions表（如果字段存在）
+      try {
+        await pool.query(
+          'UPDATE subscriptions SET uuid = ? WHERE user_id = ?',
+          [userUuid, user.user_id]
+        );
+      } catch (updateErr) {
+        // 如果uuid字段不存在，忽略更新
+        if (updateErr.code === 'ER_BAD_FIELD_ERROR' || updateErr.message && updateErr.message.includes('uuid')) {
+          // 字段不存在，忽略
+        } else {
+          throw updateErr;
+        }
+      }
     }
 
     // 订单式到期：按用户 paid 订单 + duration_days 叠加计算每个 plan 的实际到期时间
@@ -286,7 +384,7 @@ router.get('/:token', async (req, res, next) => {
       quantumult: 'text/plain; charset=utf-8'
     }[format] || 'text/plain; charset=utf-8';
 
-    const userUuid = await getOrCreateUserUuid(user.user_id);
+    // userUuid已在前面获取
 
     switch (format) {
       case 'clash':

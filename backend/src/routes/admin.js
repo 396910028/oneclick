@@ -144,11 +144,27 @@ router.get('/users/:id', async (req, res, next) => {
     let share_url = null;
     let userUuid = null;
     const [subRows] = await pool.query(
-      'SELECT token, uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+      'SELECT token FROM subscriptions WHERE user_id = ? LIMIT 1',
       [userId]
     );
     if (subRows.length > 0 && subRows[0].token) {
-      userUuid = subRows[0].uuid || null;
+      // 尝试读取uuid字段（如果字段存在）
+      try {
+        const [uuidRows] = await pool.query(
+          'SELECT uuid FROM subscriptions WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+        if (uuidRows.length > 0) {
+          userUuid = uuidRows[0].uuid || null;
+        }
+      } catch (readErr) {
+        // 如果uuid字段不存在，忽略
+        if (readErr.code === 'ER_BAD_FIELD_ERROR' || readErr.message && readErr.message.includes('uuid')) {
+          userUuid = null;
+        } else {
+          throw readErr;
+        }
+      }
       const baseUrl = await getPanelPublicUrl(req);
       if (baseUrl) {
         share_url = `${baseUrl.replace(/\/$/, '')}/api/sub/${subRows[0].token}`;

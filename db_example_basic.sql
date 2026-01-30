@@ -291,6 +291,7 @@ CREATE TABLE `subscriptions` (
   `id` INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
   `user_id` INT NOT NULL COMMENT '用户ID',
   `token` VARCHAR(100) NOT NULL COMMENT '订阅令牌',
+  `uuid` VARCHAR(36) DEFAULT NULL COMMENT '用户UUID（与订阅token绑定，重置token时同步更新）',
   `expires_at` DATETIME DEFAULT NULL COMMENT '过期时间',
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -298,6 +299,7 @@ CREATE TABLE `subscriptions` (
   UNIQUE KEY `token` (`token`),
   KEY `idx_user_id` (`user_id`),
   KEY `idx_token` (`token`),
+  KEY `idx_uuid` (`uuid`),
   CONSTRAINT `fk_sub_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订阅表';
 
