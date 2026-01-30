@@ -8,6 +8,24 @@ const router = express.Router();
 // 所有 /api/admin/* 接口都需要登录 + 管理员权限
 router.use(auth, adminOnly);
 
+// 从 system_settings 或 env 读取网站地址（用于分享/订阅 URL）
+async function getPanelPublicUrl(req) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT value FROM system_settings WHERE `key` = 'panel_public_url' LIMIT 1"
+    );
+    if (rows.length > 0 && rows[0].value) return String(rows[0].value).trim();
+  } catch (e) {
+    // 表可能不存在
+  }
+  if (process.env.PANEL_PUBLIC_URL) return String(process.env.PANEL_PUBLIC_URL).trim();
+  if (req && req.protocol && req.get) {
+    const host = req.get('host');
+    if (host) return `${req.protocol}://${host}`;
+  }
+  return '';
+}
+
 /* ========================
  * 1. 用户管理 /api/admin/users
  * ====================== */
@@ -40,11 +58,7 @@ router.get('/users', async (req, res, next) => {
               username,
               role,
               status,
-              balance,
-              traffic_total,
-              traffic_used,
-              expired_at,
-              created_at
+              balance
        FROM users
        WHERE ${where}
        ORDER BY id DESC
@@ -56,6 +70,41 @@ router.get('/users', async (req, res, next) => {
       `SELECT COUNT(*) AS total FROM users WHERE ${where}`,
       params
     );
+
+    // 为每个用户查询当前有效套餐（多个）及到期时间，拼成 current_plan_display
+    const userIds = rows.map((r) => r.id);
+    if (userIds.length > 0) {
+      const placeholders = userIds.map(() => '?').join(',');
+      const [orderRows] = await pool.query(
+        `SELECT o.user_id,
+                p.name AS plan_name,
+                pg.name AS group_name,
+                o.paid_at,
+                o.duration_days,
+                DATE_ADD(o.paid_at, INTERVAL o.duration_days DAY) AS expired_at
+         FROM orders o
+         JOIN plans p ON p.id = o.plan_id
+         JOIN plan_groups pg ON pg.id = p.group_id
+         WHERE o.user_id IN (${placeholders}) AND o.status = 'paid'
+           AND o.paid_at IS NOT NULL AND o.duration_days > 0
+           AND DATE_ADD(o.paid_at, INTERVAL o.duration_days DAY) > NOW()
+         ORDER BY o.user_id, o.paid_at DESC`,
+        userIds
+      );
+      const byUser = new Map();
+      for (const o of orderRows) {
+        if (!byUser.has(o.user_id)) byUser.set(o.user_id, []);
+        const label = o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name;
+        const expStr = o.expired_at ? new Date(o.expired_at).toISOString().slice(0, 10) : '';
+        byUser.get(o.user_id).push(expStr ? `${label} (至${expStr})` : label);
+      }
+      for (const u of rows) {
+        const plans = byUser.get(u.id) || [];
+        u.current_plan_display = plans.length ? plans.join('、') : '-';
+      }
+    } else {
+      for (const u of rows) u.current_plan_display = '-';
+    }
 
     res.json({
       code: 200,
@@ -102,7 +151,7 @@ router.get('/users/:id', async (req, res, next) => {
       [userId]
     );
     if (subRows.length > 0 && subRows[0].token) {
-      const baseUrl = process.env.PANEL_PUBLIC_URL || `${req.protocol || 'http'}://${req.get('host') || ''}`;
+      const baseUrl = (await getPanelPublicUrl(req)) || `${req.protocol || 'http'}://${req.get('host') || ''}`;
       share_url = `${baseUrl.replace(/\/$/, '')}/api/sub/${subRows[0].token}`;
     }
 
@@ -113,22 +162,24 @@ router.get('/users/:id', async (req, res, next) => {
        JOIN plan_groups pg ON pg.id = p.group_id
        WHERE o.user_id = ? AND o.status = 'paid'
        ORDER BY o.paid_at DESC, o.id DESC
-       LIMIT 20`,
+       LIMIT 50`,
       [userId]
     );
 
     const now = new Date();
-    let currentPlan = null;
-    let planActivatedAt = null;
+    const currentPlans = [];
     for (const o of orderRows) {
       const paidAt = o.paid_at ? new Date(o.paid_at) : null;
       const durationDays = Number(o.duration_days || 0);
       if (!paidAt || durationDays <= 0) continue;
       const expire = new Date(paidAt.getTime() + durationDays * 24 * 60 * 60 * 1000);
       if (expire > now) {
-        currentPlan = o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name;
-        planActivatedAt = o.paid_at;
-        break;
+        currentPlans.push({
+          plan_name: o.plan_name,
+          group_name: o.group_name,
+          display: o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name,
+          expired_at: expire.toISOString ? expire.toISOString().slice(0, 19) : expire
+        });
       }
     }
 
@@ -146,8 +197,7 @@ router.get('/users/:id', async (req, res, next) => {
         traffic_used: user.traffic_used,
         expired_at: user.expired_at,
         created_at: user.created_at,
-        current_plan: currentPlan,
-        plan_activated_at: planActivatedAt,
+        current_plans: currentPlans,
         uuids: uuidRows.map((r) => ({ uuid: r.uuid, remark: r.remark, enabled: !!r.enabled })),
         share_url
       }

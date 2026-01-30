@@ -42,15 +42,22 @@ const statusMap = {
 const columns = [
   {
     title: '订单号',
-    key: 'order_no'
+    key: 'order_no',
+    minWidth: 140,
+    maxWidth: 200,
+    ellipsis: { tooltip: true }
   },
   {
     title: '套餐',
-    key: 'plan_name'
+    key: 'plan_name',
+    minWidth: 100,
+    maxWidth: 180,
+    ellipsis: { tooltip: true }
   },
   {
     title: '金额',
     key: 'amount',
+    width: 90,
     render(row) {
       return `¥${row.amount}`;
     }
@@ -58,6 +65,7 @@ const columns = [
   {
     title: '时长',
     key: 'duration_days',
+    width: 80,
     render(row) {
       return row.duration_days ? `${row.duration_days} 天` : '-';
     }
@@ -65,6 +73,7 @@ const columns = [
   {
     title: '状态',
     key: 'status',
+    width: 90,
     render(row) {
       const info = statusMap[row.status] || { label: row.status, type: 'default' };
       return h(
@@ -77,6 +86,7 @@ const columns = [
   {
     title: '支付剩余时间',
     key: 'pay_expire_at',
+    width: 120,
     render(row) {
       if (row.status !== 'pending' || !row.pay_expire_at) return '-';
       const expire = new Date(row.pay_expire_at);
@@ -90,6 +100,7 @@ const columns = [
   {
     title: '创建时间',
     key: 'created_at',
+    width: 160,
     render(row) {
       return formatDateTimeUtc8(row.created_at);
     }
@@ -97,6 +108,7 @@ const columns = [
   {
     title: '支付时间',
     key: 'paid_at',
+    width: 160,
     render(row) {
       return formatDateTimeUtc8(row.paid_at);
     }
@@ -104,6 +116,7 @@ const columns = [
   {
     title: '操作',
     key: 'actions',
+    width: 140,
     render(row) {
       if (row.status !== 'pending') return null;
 

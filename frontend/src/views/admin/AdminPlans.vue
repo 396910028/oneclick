@@ -303,8 +303,8 @@ const groupOptions = computed(() => {
 
 const planColumns = [
   { title: 'ID', key: 'id', width: 60 },
-  { title: '总套餐', key: 'group_name', width: 120 },
-  { title: '子套餐名称', key: 'name', width: 150 },
+  { title: '总套餐', key: 'group_name', minWidth: 100, maxWidth: 140, ellipsis: { tooltip: true } },
+  { title: '子套餐名称', key: 'name', minWidth: 100, maxWidth: 200, ellipsis: { tooltip: true } },
   { title: '价格', key: 'price', width: 80, render: (row) => `¥${row.price}` },
   {
     title: '时长',

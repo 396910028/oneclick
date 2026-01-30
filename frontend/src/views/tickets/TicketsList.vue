@@ -73,15 +73,20 @@ const statusMap = {
 const columns = [
   {
     title: '工单号',
-    key: 'ticket_no'
+    key: 'ticket_no',
+    width: 140
   },
   {
     title: '标题',
-    key: 'title'
+    key: 'title',
+    minWidth: 120,
+    maxWidth: 280,
+    ellipsis: { tooltip: true }
   },
   {
     title: '分类',
     key: 'category',
+    width: 100,
     render(row) {
       const categoryMap = {
         technical: '技术问题',
@@ -95,6 +100,7 @@ const columns = [
   {
     title: '状态',
     key: 'status',
+    width: 90,
     render(row) {
       const info = statusMap[row.status] || { label: row.status, type: 'default' };
       return h(
@@ -107,6 +113,7 @@ const columns = [
   {
     title: '优先级',
     key: 'priority',
+    width: 80,
     render(row) {
       const priorityMap = {
         low: '低',
@@ -120,6 +127,7 @@ const columns = [
   {
     title: '创建时间',
     key: 'created_at',
+    width: 160,
     render(row) {
       return formatDateTimeUtc8(row.created_at);
     }
@@ -127,6 +135,7 @@ const columns = [
   {
     title: '操作',
     key: 'actions',
+    width: 80,
     render(row) {
       return h(
         NButton,

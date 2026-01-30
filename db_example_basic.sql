@@ -282,6 +282,16 @@ CREATE TABLE `user_signins` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户每日签到记录（用于签到送流量、连续签到统计）';
 
 -- -----------------------------------------------------------------------------
+-- 12. 面板设置表 system_settings（网站地址、站点名称等，供分享/订阅 URL 等使用）
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `system_settings` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT COMMENT '主键ID',
+  `key` VARCHAR(64) NOT NULL UNIQUE COMMENT '配置键',
+  `value` TEXT DEFAULT NULL COMMENT '配置值',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='面板设置（panel_public_url=网站地址, site_name=站点名称）';
+
+-- -----------------------------------------------------------------------------
 -- 10. 示例数据：nodes（节点管理用）
 -- -----------------------------------------------------------------------------
 INSERT INTO `nodes` (`name`, `address`, `port`, `protocol`, `config`, `status`, `sort_order`) VALUES
