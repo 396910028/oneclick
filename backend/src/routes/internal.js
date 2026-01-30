@@ -17,62 +17,65 @@ function requireInternalToken(req, res, next) {
   next();
 }
 
-// 获取用户「有效」的 plan_id 列表（考虑订单叠加到期 + 套餐互斥：互斥组内只认 level 最高的一条）
+// 刷新用户权益状态（请求时兜底：自动更新 expired/exhausted 状态）
+async function refreshUserEntitlementStatus(userId) {
+  // 更新已过期的权益
+  await pool.query(
+    `UPDATE user_entitlements 
+     SET status = 'expired'
+     WHERE user_id = ? 
+       AND status = 'active'
+       AND service_expire_at <= NOW()`
+  );
+  
+  // 更新已耗尽的权益
+  await pool.query(
+    `UPDATE user_entitlements 
+     SET status = 'exhausted'
+     WHERE user_id = ?
+       AND status = 'active'
+       AND traffic_total_bytes > 0
+       AND traffic_used_bytes >= traffic_total_bytes`
+  );
+}
+
+// 获取用户「有效」的 plan_id 列表（从 user_entitlements 读取，考虑套餐互斥：互斥组内只认 level 最高的一条）
 async function getActivePlanIdsForUser(userId) {
+  // 先刷新状态（请求时兜底）
+  await refreshUserEntitlementStatus(userId);
+  // 从 user_entitlements 读取有效的权益（active 且未过期且有剩余流量）
   const [rows] = await pool.query(
-    `SELECT o.id, o.plan_id, o.duration_days, o.created_at, o.paid_at,
-            p.group_id, pg.level, pg.is_exclusive
-     FROM orders o
-     JOIN plans p ON p.id = o.plan_id
-     JOIN plan_groups pg ON pg.id = p.group_id
-     WHERE o.user_id = ? AND o.status = 'paid'
-     ORDER BY COALESCE(o.paid_at, o.created_at) ASC, o.id ASC`,
+    `SELECT e.plan_id, e.group_id, pg.level, pg.is_exclusive
+     FROM user_entitlements e
+     JOIN plan_groups pg ON e.group_id = pg.id
+     WHERE e.user_id = ? 
+       AND e.status = 'active'
+       AND e.service_expire_at > NOW()
+       AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+     ORDER BY pg.level DESC, e.service_expire_at DESC`,
     [userId]
   );
 
   if (rows.length === 0) return [];
 
-  const now = new Date();
-  // 先按 plan_id 叠加计算是否仍有效（与原来一致）
-  const byPlan = new Map();
-  for (const o of rows) {
-    if (!byPlan.has(o.plan_id)) byPlan.set(o.plan_id, []);
-    byPlan.get(o.plan_id).push(o);
-  }
-
-  const validPlanIds = new Set();
-  for (const [planId, orders] of byPlan.entries()) {
-    let accExpire = null;
-    for (const o of orders) {
-      const baseStr = o.paid_at || o.created_at;
-      if (!baseStr) continue;
-      const base = new Date(baseStr);
-      const start = accExpire && accExpire > base ? accExpire : base;
-      const durationDays = Number(o.duration_days || 0);
-      if (durationDays <= 0) continue;
-      const expire = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
-      accExpire = expire;
-    }
-    if (accExpire && accExpire > now) validPlanIds.add(planId);
-  }
-
-  // 互斥组内只保留 level 最高的一条有效订单对应的 plan_id
+  // 互斥组内只保留 level 最高的一条权益对应的 plan_id
   const byGroup = new Map();
-  for (const o of rows) {
-    if (!validPlanIds.has(o.plan_id)) continue;
-    const gid = o.group_id;
+  for (const r of rows) {
+    const gid = r.group_id;
     if (!byGroup.has(gid)) byGroup.set(gid, []);
-    byGroup.get(gid).push(o);
+    byGroup.get(gid).push(r);
   }
 
   const activePlanIds = [];
-  for (const [, groupOrders] of byGroup.entries()) {
-    const isExclusive = Number(groupOrders[0]?.is_exclusive) === 1;
+  for (const [, groupEntitlements] of byGroup.entries()) {
+    const isExclusive = Number(groupEntitlements[0]?.is_exclusive) === 1;
     if (isExclusive) {
-      const best = groupOrders.reduce((a, b) => (Number(b.level) > Number(a.level) ? b : a));
+      // 互斥组：只取 level 最高的
+      const best = groupEntitlements.reduce((a, b) => (Number(b.level) > Number(a.level) ? b : a));
       activePlanIds.push(best.plan_id);
     } else {
-      groupOrders.forEach((o) => activePlanIds.push(o.plan_id));
+      // 非互斥组：全部加入
+      groupEntitlements.forEach((e) => activePlanIds.push(e.plan_id));
     }
   }
 
@@ -136,7 +139,20 @@ router.get('/auth', requireInternalToken, async (req, res, next) => {
     if (info.status !== 'active') {
       return res.json({ code: 200, message: 'success', data: { allow: false, reason: 'user_banned' } });
     }
-    if (info.traffic_total >= 0 && info.traffic_used >= info.traffic_total) {
+    
+    // 流量检查：从 entitlements 检查是否有可用权益
+    const [entitlementCheck] = await pool.query(
+      `SELECT COUNT(*) AS count
+       FROM user_entitlements
+       WHERE user_id = ?
+         AND status = 'active'
+         AND service_expire_at > NOW()
+         AND (traffic_total_bytes < 0 OR traffic_used_bytes < traffic_total_bytes)
+       LIMIT 1`,
+      [info.user_id]
+    );
+    
+    if (entitlementCheck.length === 0 || Number(entitlementCheck[0].count) === 0) {
       return res.json({ code: 200, message: 'success', data: { allow: false, reason: 'traffic_exceeded' } });
     }
 
@@ -196,12 +212,19 @@ router.get('/nodes/:nodeId/allowed-uuids', requireInternalToken, async (req, res
       const allowedNodeIds = await getAllowedNodeIdsForUser(userId, activePlanIds);
       if (!allowedNodeIds.includes(nodeId)) continue;
 
-      const [u] = await pool.query(
-        'SELECT traffic_total, traffic_used FROM users WHERE id = ? LIMIT 1',
+      // 流量检查：从 entitlements 检查是否有可用权益
+      const [entitlementCheck] = await pool.query(
+        `SELECT COUNT(*) AS count
+         FROM user_entitlements
+         WHERE user_id = ?
+           AND status = 'active'
+           AND service_expire_at > NOW()
+           AND (traffic_total_bytes < 0 OR traffic_used_bytes < traffic_total_bytes)
+         LIMIT 1`,
         [userId]
       );
-      if (u.length === 0) continue;
-      if (u[0].traffic_total >= 0 && u[0].traffic_used >= u[0].traffic_total) continue;
+      
+      if (entitlementCheck.length === 0 || Number(entitlementCheck[0].count) === 0) continue;
 
       const uuid = await getOrCreateUserUuid(userId);
       allowed.push(uuid);
@@ -253,11 +276,59 @@ router.post('/report-traffic', requireInternalToken, async (req, res, next) => {
 
     const userId = rows[0].user_id;
 
-    // 1) 累加用户已用流量
+    // 1) 累加用户已用流量（用于统计）
     await pool.query(
       'UPDATE users SET traffic_used = traffic_used + ? WHERE id = ?',
       [total, userId]
     );
+
+    // 1.1) 按策略分摊流量到 entitlements（优先消耗最早 service_expire_at 的权益）
+    const [entitlementRows] = await pool.query(
+      `SELECT id, plan_id, traffic_total_bytes, traffic_used_bytes, service_expire_at
+       FROM user_entitlements
+       WHERE user_id = ? AND status = 'active' 
+         AND service_expire_at > NOW()
+         AND (traffic_total_bytes < 0 OR traffic_used_bytes < traffic_total_bytes)
+       ORDER BY service_expire_at ASC, id ASC`,
+      [userId]
+    );
+
+    let remainingTraffic = total;
+    for (const e of entitlementRows) {
+      if (remainingTraffic <= 0) break;
+      
+      // 计算该权益的可用流量
+      const availableTraffic = e.traffic_total_bytes < 0 
+        ? Number.MAX_SAFE_INTEGER 
+        : Math.max(0, Number(e.traffic_total_bytes || 0) - Number(e.traffic_used_bytes || 0));
+      
+      if (availableTraffic <= 0) continue;
+      
+      // 消耗该权益的流量
+      const consumeAmount = Math.min(remainingTraffic, availableTraffic);
+      await pool.query(
+        'UPDATE user_entitlements SET traffic_used_bytes = traffic_used_bytes + ? WHERE id = ?',
+        [consumeAmount, e.id]
+      );
+      
+      remainingTraffic -= consumeAmount;
+      
+      // 检查是否已耗尽，如果是则更新状态为 exhausted
+      if (e.traffic_total_bytes >= 0) {
+        const [updated] = await pool.query(
+          `SELECT traffic_used_bytes, traffic_total_bytes 
+           FROM user_entitlements 
+           WHERE id = ?`,
+          [e.id]
+        );
+        if (updated.length > 0 && updated[0].traffic_used_bytes >= updated[0].traffic_total_bytes) {
+          await pool.query(
+            'UPDATE user_entitlements SET status = ? WHERE id = ?',
+            ['exhausted', e.id]
+          );
+        }
+      }
+    }
 
     // 2) 累加节点每日流量
     await pool.query(

@@ -9,41 +9,43 @@ const router = express.Router();
 router.use(auth, adminOnly);
 
 async function getActivePlanIdsForUser(userId) {
+  // 从 user_entitlements 读取有效的权益（active 且未过期且有剩余流量）
   const [rows] = await pool.query(
-    `SELECT id, plan_id, duration_days, created_at, paid_at
-     FROM orders
-     WHERE user_id = ?
-       AND status = 'paid'
-     ORDER BY COALESCE(paid_at, created_at) ASC, id ASC`,
+    `SELECT e.plan_id, e.group_id, pg.level, pg.is_exclusive
+     FROM user_entitlements e
+     JOIN plan_groups pg ON e.group_id = pg.id
+     WHERE e.user_id = ? 
+       AND e.status = 'active'
+       AND e.service_expire_at > NOW()
+       AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+     ORDER BY pg.level DESC, e.service_expire_at DESC`,
     [userId]
   );
 
   if (rows.length === 0) return [];
 
-  const now = new Date();
-  const byPlan = new Map();
-  for (const o of rows) {
-    if (!byPlan.has(o.plan_id)) byPlan.set(o.plan_id, []);
-    byPlan.get(o.plan_id).push(o);
+  // 互斥组内只保留 level 最高的一条权益对应的 plan_id
+  const byGroup = new Map();
+  for (const r of rows) {
+    const gid = r.group_id;
+    if (!byGroup.has(gid)) byGroup.set(gid, []);
+    byGroup.get(gid).push(r);
   }
 
   const activePlanIds = [];
-  for (const [planId, orders] of byPlan.entries()) {
-    let accExpire = null;
-    for (const o of orders) {
-      const baseStr = o.paid_at || o.created_at;
-      if (!baseStr) continue;
-      const base = new Date(baseStr);
-      const start = accExpire && accExpire > base ? accExpire : base;
-      const durationDays = Number(o.duration_days || 0);
-      if (durationDays <= 0) continue;
-      const expire = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
-      accExpire = expire;
+  for (const [, groupEntitlements] of byGroup.entries()) {
+    const isExclusive = Number(groupEntitlements[0]?.is_exclusive) === 1;
+    if (isExclusive) {
+      // 互斥组：只取 level 最高的
+      const best = groupEntitlements.reduce((a, b) => (Number(b.level) > Number(a.level) ? b : a));
+      activePlanIds.push(best.plan_id);
+    } else {
+      // 非互斥组：全部加入
+      groupEntitlements.forEach((e) => activePlanIds.push(e.plan_id));
     }
-    if (accExpire && accExpire > now) activePlanIds.push(planId);
   }
 
-  return activePlanIds;
+  return [...new Set(activePlanIds)];
 }
 
 async function getAllowedNodeIdsForUser(userId, activePlanIds) {
@@ -58,13 +60,15 @@ async function getAllowedNodeIdsForUser(userId, activePlanIds) {
 }
 
 async function getAllowedUUIDsForNode(nodeId) {
-  // 先找可能用户（具备 paid 订单且绑定该节点；再精算有效期/流量/权限）
+  // 先找可能用户（具备有效权益且绑定该节点）
   const [userRows] = await pool.query(
-    `SELECT DISTINCT o.user_id
-     FROM orders o
-     JOIN plan_nodes pn ON pn.plan_id = o.plan_id
-     JOIN users u ON u.id = o.user_id
-     WHERE o.status = 'paid'
+    `SELECT DISTINCT e.user_id
+     FROM user_entitlements e
+     JOIN plan_nodes pn ON pn.plan_id = e.plan_id
+     JOIN users u ON u.id = e.user_id
+     WHERE e.status = 'active'
+       AND e.service_expire_at > NOW()
+       AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
        AND pn.node_id = ?
        AND u.status = 'active'`,
     [nodeId]
@@ -77,13 +81,6 @@ async function getAllowedUUIDsForNode(nodeId) {
     if (activePlanIds.length === 0) continue;
     const allowedNodeIds = await getAllowedNodeIdsForUser(userId, activePlanIds);
     if (!allowedNodeIds.includes(nodeId)) continue;
-
-    const [u] = await pool.query(
-      'SELECT traffic_total, traffic_used FROM users WHERE id = ? LIMIT 1',
-      [userId]
-    );
-    if (u.length === 0) continue;
-    if (u[0].traffic_total >= 0 && u[0].traffic_used >= u[0].traffic_total) continue;
 
     const [uuidRows] = await pool.query(
       'SELECT uuid FROM user_clients WHERE user_id = ? AND enabled = 1 ORDER BY id ASC LIMIT 1',

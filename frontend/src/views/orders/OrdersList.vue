@@ -60,7 +60,7 @@ const page = ref(1);
 const pageSize = ref(10);
 
 const showUnsubscribeModal = ref(false);
-const unsubForm = ref({ duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '', full_refund: false });
+const unsubForm = ref({ duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '', refund_type: 'partial' });
 const unsubFormRef = ref(null);
 const unsubLoading = ref(false);
 const remainingInfo = ref(null);

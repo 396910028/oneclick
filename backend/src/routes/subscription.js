@@ -242,12 +242,46 @@ router.get('/:token', async (req, res, next) => {
       return res.status(403).send('# 账户已被停用');
     }
 
-    // 检查用户是否已过期（expired_at <= NOW()）
-    if (user.expired_at) {
-      const expiredAt = new Date(user.expired_at);
-      if (expiredAt <= new Date()) {
-        return res.status(403).send('# 订阅已过期');
+    // 从 user_entitlements 获取用户有效权益
+    const [entitlementRows] = await pool.query(
+      `SELECT e.plan_id, e.group_id, e.traffic_total_bytes, e.traffic_used_bytes, pg.level, pg.is_exclusive
+       FROM user_entitlements e
+       JOIN plan_groups pg ON e.group_id = pg.id
+       WHERE e.user_id = ?
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+         AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+       ORDER BY pg.level DESC, e.service_expire_at DESC`,
+      [user.user_id]
+    );
+
+    if (entitlementRows.length === 0) {
+      return res.status(403).send('# 您还没有可用的套餐');
+    }
+
+    // 互斥组内只保留 level 最高的一条权益对应的 plan_id
+    const byGroup = new Map();
+    for (const e of entitlementRows) {
+      const gid = e.group_id;
+      if (!byGroup.has(gid)) byGroup.set(gid, []);
+      byGroup.get(gid).push(e);
+    }
+
+    const activePlanIds = [];
+    for (const [, groupEntitlements] of byGroup.entries()) {
+      const isExclusive = Number(groupEntitlements[0]?.is_exclusive) === 1;
+      if (isExclusive) {
+        // 互斥组：只取 level 最高的
+        const best = groupEntitlements.reduce((a, b) => (Number(b.level) > Number(a.level) ? b : a));
+        activePlanIds.push(best.plan_id);
+      } else {
+        // 非互斥组：全部加入
+        groupEntitlements.forEach((e) => activePlanIds.push(e.plan_id));
       }
+    }
+
+    if (activePlanIds.length === 0) {
+      return res.status(403).send('# 订阅已过期');
     }
 
     // 获取UUID：优先使用subscriptions表中的UUID
@@ -287,64 +321,6 @@ router.get('/:token', async (req, res, next) => {
           throw updateErr;
         }
       }
-    }
-
-    // 订单式到期：按用户 paid 订单 + duration_days 叠加计算每个 plan 的实际到期时间
-    const [paidOrders] = await pool.query(
-      `SELECT o.id, o.plan_id, o.duration_days, o.created_at, o.paid_at,
-              p.traffic_limit
-       FROM orders o
-       JOIN plans p ON o.plan_id = p.id
-       WHERE o.user_id = ?
-         AND o.status = 'paid'
-       ORDER BY COALESCE(o.paid_at, o.created_at) ASC, o.id ASC`,
-      [user.user_id]
-    );
-
-    if (paidOrders.length === 0) {
-      return res.status(403).send('# 您还没有可用的套餐');
-    }
-
-    const now = new Date();
-    const byPlan = new Map();
-    for (const o of paidOrders) {
-      if (!byPlan.has(o.plan_id)) byPlan.set(o.plan_id, []);
-      byPlan.get(o.plan_id).push(o);
-    }
-
-    const activePlanIds = [];
-    let totalTrafficLimit = 0; // 所有有效订单的总流量配额（一次性，无重置周期）
-
-    for (const [planId, orders] of byPlan.entries()) {
-      let accExpire = null;
-      for (const o of orders) {
-        const baseStr = o.paid_at || o.created_at;
-        if (!baseStr) continue;
-        const base = new Date(baseStr);
-        const start = accExpire && accExpire > base ? accExpire : base;
-        const durationDays = Number(o.duration_days || 0);
-        if (durationDays <= 0) continue;
-        const expire = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        accExpire = expire;
-      }
-      if (accExpire && accExpire > now) {
-        activePlanIds.push(planId);
-        // 累加该套餐的流量配额（只累加一次，即使有多个订单）
-        const planTrafficLimit = Number(orders[0].traffic_limit || 0);
-        if (planTrafficLimit > 0) {
-          totalTrafficLimit += planTrafficLimit;
-        }
-      }
-    }
-
-    if (activePlanIds.length === 0) {
-      return res.status(403).send('# 订阅已过期');
-    }
-
-    // 检查流量是否超限（一次性配额，无重置周期）
-    // 总配额 0 = 不可使用；总配额 > 0 且已用 >= 总配额 = 流量已用完
-    if (totalTrafficLimit >= 0 && user.traffic_used >= totalTrafficLimit) {
-      return res.status(403).send('# 流量已用完');
     }
 
     const [nodeIdRows] = await pool.query(

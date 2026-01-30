@@ -5,6 +5,174 @@ const adminOnly = require('../middleware/admin');
 
 const router = express.Router();
 
+// 刷新用户权益状态（请求时兜底：自动更新 expired/exhausted 状态）
+async function refreshUserEntitlementStatus(userId) {
+  // 更新已过期的权益
+  await pool.query(
+    `UPDATE user_entitlements 
+     SET status = 'expired'
+     WHERE user_id = ? 
+       AND status = 'active'
+       AND service_expire_at <= NOW()`,
+    [userId]
+  );
+  
+  // 更新已耗尽的权益
+  await pool.query(
+    `UPDATE user_entitlements 
+     SET status = 'exhausted'
+     WHERE user_id = ?
+       AND status = 'active'
+       AND traffic_total_bytes > 0
+       AND traffic_used_bytes >= traffic_total_bytes`,
+    [userId]
+  );
+}
+
+// 更新用户权益（退订时调用）
+async function updateUserEntitlementOnUnsubscribe(connection, userId, groupId, planId, orderId, daysDeduct, trafficBytesDeduct, fullRefund, remark) {
+  // 查找该用户该 group+plan 的 active 权益
+  const [entitlements] = await connection.query(
+    `SELECT id, service_expire_at, traffic_total_bytes, traffic_used_bytes, original_expire_at
+     FROM user_entitlements 
+     WHERE user_id = ? AND group_id = ? AND plan_id = ? AND status = 'active' 
+     ORDER BY service_expire_at DESC 
+     LIMIT 1`,
+    [userId, groupId, planId]
+  );
+  
+  if (entitlements.length === 0) {
+    return false; // 没有找到对应的权益
+  }
+  
+  const entitlement = entitlements[0];
+  const now = new Date();
+  
+  if (fullRefund) {
+    // 全额退订：标记为 cancelled，设置 service_expire_at 为当前时间
+    await connection.query(
+      `UPDATE user_entitlements 
+       SET status = 'cancelled',
+           service_expire_at = NOW(),
+           traffic_total_bytes = GREATEST(traffic_used_bytes, traffic_total_bytes - ?),
+           cancel_reason = ?,
+           cancelled_at = NOW(),
+           last_order_id = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [
+        trafficBytesDeduct,
+        remark || '全额退订',
+        orderId,
+        entitlement.id
+      ]
+    );
+    
+    // 如果扣减后流量已用完，标记为 exhausted
+    await connection.query(
+      `UPDATE user_entitlements 
+       SET status = 'exhausted'
+       WHERE id = ? AND traffic_total_bytes > 0 AND traffic_used_bytes >= traffic_total_bytes`,
+      [entitlement.id]
+    );
+  } else {
+    // 部分退订：扣减天数（只改 service_expire_at）和流量
+    const currentExpireAt = new Date(entitlement.service_expire_at);
+    const newExpireAt = new Date(currentExpireAt.getTime() - daysDeduct * 24 * 60 * 60 * 1000);
+    const newTrafficTotal = Math.max(
+      Number(entitlement.traffic_used_bytes || 0),
+      Number(entitlement.traffic_total_bytes || 0) - trafficBytesDeduct
+    );
+    
+    let newStatus = 'active';
+    if (newExpireAt <= now) {
+      newStatus = 'cancelled';
+    } else if (newTrafficTotal > 0 && Number(entitlement.traffic_used_bytes || 0) >= newTrafficTotal) {
+      newStatus = 'exhausted';
+    }
+    
+    await connection.query(
+      `UPDATE user_entitlements 
+       SET service_expire_at = ?,
+           traffic_total_bytes = ?,
+           status = ?,
+           last_order_id = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [
+        newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
+        newTrafficTotal,
+        newStatus,
+        orderId,
+        entitlement.id
+      ]
+    );
+  }
+  
+  return true;
+}
+
+// 创建或更新用户权益（支付成功时调用）
+async function upsertUserEntitlement(connection, userId, groupId, planId, orderId, paidAt, durationDays, trafficAmount) {
+  const now = new Date(paidAt);
+  const expireAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+  
+  // 检查是否已存在同 group+plan 的 active 权益
+  const [existing] = await connection.query(
+    `SELECT id, traffic_total_bytes, service_expire_at 
+     FROM user_entitlements 
+     WHERE user_id = ? AND group_id = ? AND plan_id = ? AND status = 'active' 
+     LIMIT 1`,
+    [userId, groupId, planId]
+  );
+  
+  if (existing.length > 0) {
+    // 更新现有权益：延长到期时间，累加流量
+    const existingEntitlement = existing[0];
+    const newExpireAt = new Date(Math.max(
+      new Date(existingEntitlement.service_expire_at).getTime(),
+      expireAt.getTime()
+    ));
+    
+    await connection.query(
+      `UPDATE user_entitlements 
+       SET original_expire_at = ?,
+           service_expire_at = ?,
+           traffic_total_bytes = traffic_total_bytes + ?,
+           last_order_id = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [
+        newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
+        newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
+        trafficAmount,
+        orderId,
+        existingEntitlement.id
+      ]
+    );
+  } else {
+    // 创建新权益
+    await connection.query(
+      `INSERT INTO user_entitlements 
+       (user_id, group_id, plan_id, status, original_started_at, original_expire_at, 
+        service_started_at, service_expire_at, traffic_total_bytes, traffic_used_bytes, 
+        last_order_id, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, NOW(), NOW())`,
+      [
+        userId,
+        groupId,
+        planId,
+        paidAt.toISOString().slice(0, 19).replace('T', ' '),
+        expireAt.toISOString().slice(0, 19).replace('T', ' '),
+        paidAt.toISOString().slice(0, 19).replace('T', ' '),
+        expireAt.toISOString().slice(0, 19).replace('T', ' '),
+        trafficAmount,
+        orderId
+      ]
+    );
+  }
+}
+
 // 所有 /api/admin/* 接口都需要登录 + 管理员权限
 router.use(auth, adminOnly);
 
@@ -71,32 +239,31 @@ router.get('/users', async (req, res, next) => {
       params
     );
 
-    // 为每个用户查询当前有效套餐（多个）及到期时间，拼成 current_plan_display
+    // 为每个用户查询当前有效套餐（多个）及到期时间，拼成 current_plan_display（从 user_entitlements 读取）
     const userIds = rows.map((r) => r.id);
     if (userIds.length > 0) {
       const placeholders = userIds.map(() => '?').join(',');
-      const [orderRows] = await pool.query(
-        `SELECT o.user_id,
+      const [entitlementRows] = await pool.query(
+        `SELECT e.user_id,
                 p.name AS plan_name,
                 pg.name AS group_name,
-                o.paid_at,
-                o.duration_days,
-                DATE_ADD(o.paid_at, INTERVAL o.duration_days DAY) AS expired_at
-         FROM orders o
-         JOIN plans p ON p.id = o.plan_id
-         JOIN plan_groups pg ON pg.id = p.group_id
-         WHERE o.user_id IN (${placeholders}) AND o.status = 'paid'
-           AND o.paid_at IS NOT NULL AND o.duration_days > 0
-           AND DATE_ADD(o.paid_at, INTERVAL o.duration_days DAY) > NOW()
-         ORDER BY o.user_id, o.paid_at DESC`,
+                e.service_expire_at AS expired_at
+         FROM user_entitlements e
+         JOIN plans p ON p.id = e.plan_id
+         JOIN plan_groups pg ON pg.id = e.group_id
+         WHERE e.user_id IN (${placeholders}) 
+           AND e.status = 'active'
+           AND e.service_expire_at > NOW()
+           AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+         ORDER BY e.user_id, e.service_expire_at DESC`,
         userIds
       );
       const byUser = new Map();
-      for (const o of orderRows) {
-        if (!byUser.has(o.user_id)) byUser.set(o.user_id, []);
-        const label = o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name;
-        const expStr = o.expired_at ? new Date(o.expired_at).toISOString().slice(0, 10) : '';
-        byUser.get(o.user_id).push(expStr ? `${label} (至${expStr})` : label);
+      for (const e of entitlementRows) {
+        if (!byUser.has(e.user_id)) byUser.set(e.user_id, []);
+        const label = e.group_name ? `${e.group_name} - ${e.plan_name}` : e.plan_name;
+        const expStr = e.expired_at ? new Date(e.expired_at).toISOString().slice(0, 10) : '';
+        byUser.get(e.user_id).push(expStr ? `${label} (至${expStr})` : label);
       }
       for (const u of rows) {
         const plans = byUser.get(u.id) || [];
@@ -128,6 +295,9 @@ router.get('/users/:id', async (req, res, next) => {
     if (!userId) {
       return res.status(400).json({ code: 400, message: 'id invalid', data: null });
     }
+    
+    // 先刷新状态（请求时兜底）
+    await refreshUserEntitlementStatus(userId);
 
     const [userRows] = await pool.query(
       `SELECT id, username, email, role, status, balance, traffic_total, traffic_used, expired_at, created_at
@@ -189,39 +359,28 @@ router.get('/users/:id', async (req, res, next) => {
       }
     }
 
-    const [orderRows] = await pool.query(
-      `SELECT o.id, o.plan_id, o.paid_at, o.duration_days, o.status, p.name AS plan_name, pg.name AS group_name
-       FROM orders o
-       JOIN plans p ON p.id = o.plan_id
-       JOIN plan_groups pg ON pg.id = p.group_id
-       WHERE o.user_id = ? AND o.status = 'paid'
-       ORDER BY o.paid_at DESC, o.id DESC
-       LIMIT 50`,
+    // 从 user_entitlements 获取用户当前有效权益
+    const [entitlementRows] = await pool.query(
+      `SELECT e.id, e.plan_id, e.service_expire_at, p.name AS plan_name, pg.name AS group_name
+       FROM user_entitlements e
+       JOIN plans p ON e.plan_id = p.id
+       JOIN plan_groups pg ON e.group_id = pg.id
+       WHERE e.user_id = ?
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+         AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+       ORDER BY e.service_expire_at DESC`,
       [userId]
     );
-
-    const now = new Date();
-    // 检查用户的expired_at，如果已过期则不应显示当前套餐
-    const userExpiredAt = user.expired_at ? new Date(user.expired_at) : null;
-    const isUserExpired = userExpiredAt && userExpiredAt <= now;
     
     const currentPlans = [];
-    // 如果用户已过期，不显示任何当前套餐
-    if (!isUserExpired) {
-      for (const o of orderRows) {
-        const paidAt = o.paid_at ? new Date(o.paid_at) : null;
-        const durationDays = Number(o.duration_days || 0);
-        if (!paidAt || durationDays <= 0) continue;
-        const expire = new Date(paidAt.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        if (expire > now) {
-          currentPlans.push({
-            plan_name: o.plan_name,
-            group_name: o.group_name,
-            display: o.group_name ? `${o.group_name} - ${o.plan_name}` : o.plan_name,
-            expired_at: expire.toISOString ? expire.toISOString().slice(0, 19) : expire
-          });
-        }
-      }
+    for (const e of entitlementRows) {
+      currentPlans.push({
+        plan_name: e.plan_name,
+        group_name: e.group_name,
+        display: e.group_name ? `${e.group_name} - ${e.plan_name}` : e.plan_name,
+        expired_at: e.service_expire_at
+      });
     }
 
     res.json({
@@ -318,27 +477,33 @@ router.patch('/users/:id', async (req, res, next) => {
   }
 });
 
-// GET /api/admin/users/:id/remaining 获取用户剩余天数和流量（用于退订）
+// GET /api/admin/users/:id/remaining 获取用户剩余天数和流量（用于退订，从 user_entitlements 读取）
 router.get('/users/:id/remaining', async (req, res, next) => {
   try {
     const userId = Number(req.params.id);
     if (!userId) {
       return res.status(400).json({ code: 400, message: '用户 id 无效', data: null });
     }
+    
+    // 先刷新状态（请求时兜底）
+    await refreshUserEntitlementStatus(userId);
 
-    // 获取用户当前所有已支付订单（购买和退订）
-    const [orderRows] = await pool.query(
-      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
-              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
-       FROM orders o
-       JOIN plans p ON o.plan_id = p.id
-       JOIN plan_groups pg ON p.group_id = pg.id
-       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
-       ORDER BY o.paid_at ASC, o.id ASC`,
+    // 从 user_entitlements 获取用户有效权益
+    const [entitlementRows] = await pool.query(
+      `SELECT e.id, e.group_id, e.plan_id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes,
+              pg.name AS group_name, p.name AS plan_name
+       FROM user_entitlements e
+       JOIN plan_groups pg ON e.group_id = pg.id
+       JOIN plans p ON e.plan_id = p.id
+       WHERE e.user_id = ?
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+         AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+       ORDER BY e.service_expire_at DESC`,
       [userId]
     );
 
-    if (orderRows.length === 0) {
+    if (entitlementRows.length === 0) {
       return res.json({
         code: 200,
         message: 'success',
@@ -352,43 +517,39 @@ router.get('/users/:id/remaining', async (req, res, next) => {
       });
     }
 
-    // 计算剩余天数和流量
-    const [userRows] = await pool.query(
-      'SELECT traffic_total, traffic_used, expired_at FROM users WHERE id = ? LIMIT 1',
-      [userId]
-    );
-    const user = userRows[0];
-    const userTrafficTotal = Number(user.traffic_total || 0);
-    const userTrafficUsed = Number(user.traffic_used || 0);
-    const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
-
-    // 计算剩余天数（从最早订单开始累加）
-    let totalDays = 0;
-    let earliestPaidAt = null;
-    for (const o of orderRows) {
-      const paidAt = new Date(o.paid_at);
-      if (!earliestPaidAt || paidAt < earliestPaidAt) {
-        earliestPaidAt = paidAt;
-      }
-      totalDays += Number(o.duration_days || 0);
-    }
+    // 计算总剩余天数和流量（取最晚到期的权益）
     const now = new Date();
-    const expireAt = earliestPaidAt ? new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000) : null;
-    const remainingDays = expireAt && expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+    let maxRemainingDays = 0;
+    let maxRemainingTraffic = 0;
+    let currentPlanInfo = null;
+
+    for (const e of entitlementRows) {
+      const expireAt = new Date(e.service_expire_at);
+      const remainingDays = expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+      const remainingTraffic = e.traffic_total_bytes < 0 
+        ? Number.MAX_SAFE_INTEGER 
+        : Math.max(0, Number(e.traffic_total_bytes || 0) - Number(e.traffic_used_bytes || 0));
+      
+      if (remainingDays > maxRemainingDays || (remainingDays === maxRemainingDays && remainingTraffic > maxRemainingTraffic)) {
+        maxRemainingDays = remainingDays;
+        maxRemainingTraffic = remainingTraffic;
+        currentPlanInfo = {
+          group_id: e.group_id,
+          group_name: e.group_name,
+          plan_name: e.plan_name
+        };
+      }
+    }
 
     res.json({
       code: 200,
       message: 'success',
       data: {
-        remaining_days: remainingDays,
-        remaining_traffic_bytes: remainingTraffic,
-        remaining_traffic_gb: (remainingTraffic / (1024 ** 3)).toFixed(2),
-        current_plan: orderRows.length > 0 ? {
-          group_id: orderRows[0].group_id,
-          group_name: orderRows[0].group_name,
-          plan_name: orderRows[0].plan_name
-        } : null,
-        can_unsubscribe: remainingDays > 0 || remainingTraffic > 0
+        remaining_days: maxRemainingDays,
+        remaining_traffic_bytes: maxRemainingTraffic,
+        remaining_traffic_gb: (maxRemainingTraffic / (1024 ** 3)).toFixed(2),
+        current_plan: currentPlanInfo,
+        can_unsubscribe: maxRemainingDays > 0 || maxRemainingTraffic > 0
       }
     });
   } catch (err) {
@@ -421,19 +582,21 @@ router.post('/users/:id/unsubscribe', async (req, res, next) => {
       });
     }
 
-    // 获取用户当前套餐剩余
-    const [orderRows] = await connection.query(
-      `SELECT o.id, o.plan_id, o.order_type, o.paid_at, o.duration_days, o.traffic_amount, o.status,
-              p.name AS plan_name, pg.name AS group_name, pg.id AS group_id
-       FROM orders o
-       JOIN plans p ON o.plan_id = p.id
-       JOIN plan_groups pg ON p.group_id = pg.id
-       WHERE o.user_id = ? AND o.status = 'paid' AND o.paid_at IS NOT NULL
-       ORDER BY o.paid_at ASC, o.id ASC`,
+    // 从 user_entitlements 获取用户当前有效权益
+    const [entitlementRows] = await connection.query(
+      `SELECT e.id, e.group_id, e.plan_id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes,
+              pg.name AS group_name, p.name AS plan_name
+       FROM user_entitlements e
+       JOIN plan_groups pg ON e.group_id = pg.id
+       JOIN plans p ON e.plan_id = p.id
+       WHERE e.user_id = ? AND e.status = 'active' 
+         AND e.service_expire_at > NOW()
+         AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+       ORDER BY e.service_expire_at DESC`,
       [userId]
     );
 
-    if (orderRows.length === 0) {
+    if (entitlementRows.length === 0) {
       connection.release();
       return res.status(400).json({
         code: 400,
@@ -442,29 +605,28 @@ router.post('/users/:id/unsubscribe', async (req, res, next) => {
       });
     }
 
-    // 计算剩余天数和流量
-    const [userRows] = await connection.query(
-      'SELECT traffic_total, traffic_used, expired_at FROM users WHERE id = ? LIMIT 1',
-      [userId]
-    );
-    const user = userRows[0];
-    const userTrafficTotal = Number(user.traffic_total || 0);
-    const userTrafficUsed = Number(user.traffic_used || 0);
-    const remainingTraffic = Math.max(0, userTrafficTotal - userTrafficUsed);
-
-    // 计算剩余天数（从最早订单开始累加）
-    let totalDays = 0;
-    let earliestPaidAt = null;
-    for (const o of orderRows) {
-      const paidAt = new Date(o.paid_at);
-      if (!earliestPaidAt || paidAt < earliestPaidAt) {
-        earliestPaidAt = paidAt;
-      }
-      totalDays += Number(o.duration_days || 0);
-    }
+    // 计算总剩余天数和流量（取最晚到期的权益）
     const now = new Date();
-    const expireAt = earliestPaidAt ? new Date(earliestPaidAt.getTime() + totalDays * 24 * 60 * 60 * 1000) : null;
-    const remainingDays = expireAt && expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+    let maxRemainingDays = 0;
+    let maxRemainingTraffic = 0;
+    let targetEntitlement = null;
+    
+    for (const e of entitlementRows) {
+      const expireAt = new Date(e.service_expire_at);
+      const remainingDays = expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+      const remainingTraffic = e.traffic_total_bytes < 0 
+        ? Number.MAX_SAFE_INTEGER 
+        : Math.max(0, Number(e.traffic_total_bytes || 0) - Number(e.traffic_used_bytes || 0));
+      
+      if (remainingDays > maxRemainingDays || (remainingDays === maxRemainingDays && remainingTraffic > maxRemainingTraffic)) {
+        maxRemainingDays = remainingDays;
+        maxRemainingTraffic = remainingTraffic;
+        targetEntitlement = e;
+      }
+    }
+    
+    const remainingDays = maxRemainingDays;
+    const remainingTraffic = maxRemainingTraffic;
 
     let finalDaysDeduct = daysDeduct;
     let finalTrafficDeduct = trafficBytesDeduct;
@@ -494,16 +656,44 @@ router.post('/users/:id/unsubscribe', async (req, res, next) => {
 
     await connection.beginTransaction();
 
-    const planId = plan_id ? Number(plan_id) : orderRows[0].plan_id;
+    // 使用目标权益的 plan_id 和 group_id（如果指定了 plan_id 则使用指定的，否则使用目标权益的）
+    const planId = plan_id ? Number(plan_id) : targetEntitlement.plan_id;
+    const groupId = targetEntitlement.group_id;
     const orderNo = `UNSUB${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
-    await connection.query(
+    
+    // 创建退订订单（审计用）
+    const [orderResult] = await connection.query(
       `INSERT INTO orders
        (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, remark, created_at, paid_at)
        VALUES (?, ?, ?, 0, 'balance', 'paid', 'unsubscribe', ?, ?, ?, NOW(), NOW())`,
       [userId, planId, orderNo, -finalDaysDeduct, -finalTrafficDeduct, (remark || '').slice(0, 255)]
     );
+    const orderId = orderResult.insertId;
 
-    // 扣减流量（不退订时不改变到期时间）
+    // 更新用户权益
+    const updated = await updateUserEntitlementOnUnsubscribe(
+      connection,
+      userId,
+      groupId,
+      planId,
+      orderId,
+      finalDaysDeduct,
+      finalTrafficDeduct,
+      full_refund,
+      remark || '管理员退订'
+    );
+    
+    if (!updated) {
+      await connection.rollback();
+      connection.release();
+      return res.status(400).json({
+        code: 400,
+        message: '无法找到对应的权益记录',
+        data: null
+      });
+    }
+
+    // 同时更新 users 表（兼容旧逻辑）
     if (finalTrafficDeduct > 0) {
       await connection.query(
         'UPDATE users SET traffic_total = GREATEST(0, traffic_total - ?) WHERE id = ?',
@@ -1099,22 +1289,35 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
       });
     }
 
-    // 查询套餐的流量与时长
+    // 查询套餐的流量与时长，以及 group_id
     const [planRows] = await connection.query(
-      'SELECT traffic_limit, duration_days FROM plans WHERE id = ? LIMIT 1',
+      `SELECT p.traffic_limit, p.duration_days, p.group_id 
+       FROM plans p 
+       WHERE p.id = ? LIMIT 1`,
       [order.plan_id]
     );
     const trafficLimit = planRows.length > 0 ? Number(planRows[0].traffic_limit || 0) : 0;
     const durationDays = planRows.length > 0 ? Number(planRows[0].duration_days || 0) : 0;
+    const groupId = planRows.length > 0 ? Number(planRows[0].group_id || 0) : null;
+
+    if (!groupId) {
+      await connection.rollback();
+      return res.status(400).json({
+        code: 400,
+        message: '套餐数据异常，无法获取总套餐ID',
+        data: null
+      });
+    }
 
     // 更新订单状态并写入流量（便于列表展示）
+    const paidAt = new Date();
     await connection.query(
       `UPDATE orders
        SET status = 'paid',
-           paid_at = NOW(),
+           paid_at = ?,
            traffic_amount = ?
        WHERE id = ?`,
-      [trafficLimit, id]
+      [paidAt.toISOString().slice(0, 19).replace('T', ' '), trafficLimit, id]
     );
 
     if (trafficLimit > 0) {
@@ -1134,6 +1337,18 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
         [durationDays, durationDays, order.user_id]
       );
     }
+    
+    // 创建或更新用户权益
+    await upsertUserEntitlement(
+      connection,
+      order.user_id,
+      groupId,
+      order.plan_id,
+      Number(id),
+      paidAt,
+      durationDays,
+      trafficLimit
+    );
 
     await connection.commit();
 
@@ -1442,49 +1657,83 @@ router.post('/settings/internal-api-key', (req, res) => {
   });
 });
 
-// GET /api/admin/settings/panel 获取面板设置（面板网址）
+// GET /api/admin/settings/panel 获取面板设置（面板网址、网站名称、公告等）
 router.get('/settings/panel', async (req, res, next) => {
   try {
     const [rows] = await pool.query(
-      "SELECT value FROM system_settings WHERE `key` = 'panel_public_url' LIMIT 1"
+      "SELECT `key`, value FROM system_settings WHERE `key` IN ('panel_public_url', 'site_name', 'announcement', 'support_url', 'allow_register')"
     );
-    const panelUrl = rows.length > 0 && rows[0].value ? String(rows[0].value).trim() : '';
+    const settings = {};
+    for (const r of rows) {
+      if (r.key === 'allow_register') {
+        settings[r.key] = r.value === '1' || r.value === 'true' || r.value === true;
+      } else {
+        settings[r.key] = r.value || '';
+      }
+    }
     res.json({
       code: 200,
       message: 'success',
-      data: { panel_public_url: panelUrl }
+      data: {
+        panel_public_url: settings.panel_public_url || '',
+        site_name: settings.site_name || '',
+        announcement: settings.announcement || '',
+        support_url: settings.support_url || '',
+        allow_register: settings.allow_register !== undefined ? settings.allow_register : true
+      }
     });
   } catch (err) {
     next(err);
   }
 });
 
-// PUT /api/admin/settings/panel 更新面板设置（面板网址）
+// PUT /api/admin/settings/panel 更新面板设置（面板网址、网站名称、公告等）
 router.put('/settings/panel', async (req, res, next) => {
   try {
-    const { panel_public_url } = req.body || {};
-    const url = panel_public_url ? String(panel_public_url).trim() : '';
+    const { panel_public_url, site_name, announcement, support_url, allow_register } = req.body || {};
     
-    // 验证URL格式（简单验证）
-    if (url && !/^https?:\/\/.+/.test(url)) {
-      return res.status(400).json({
-        code: 400,
-        message: '面板网址格式不正确，应为 http:// 或 https:// 开头',
-        data: null
-      });
+    // 验证URL格式（如果提供了 panel_public_url）
+    if (panel_public_url !== undefined) {
+      const url = panel_public_url ? String(panel_public_url).trim() : '';
+      if (url && !/^https?:\/\/.+/.test(url)) {
+        return res.status(400).json({
+          code: 400,
+          message: '面板网址格式不正确，应为 http:// 或 https:// 开头',
+          data: null
+        });
+      }
     }
-
-    await pool.query(
-      `INSERT INTO system_settings (\`key\`, \`value\`, updated_at)
-       VALUES ('panel_public_url', ?, NOW())
-       ON DUPLICATE KEY UPDATE \`value\` = ?, updated_at = NOW()`,
-      [url, url]
-    );
-
+    
+    const updates = [];
+    if (panel_public_url !== undefined) {
+      updates.push({ key: 'panel_public_url', value: String(panel_public_url || '') });
+    }
+    if (site_name !== undefined) {
+      updates.push({ key: 'site_name', value: String(site_name || '') });
+    }
+    if (announcement !== undefined) {
+      updates.push({ key: 'announcement', value: String(announcement || '') });
+    }
+    if (support_url !== undefined) {
+      updates.push({ key: 'support_url', value: String(support_url || '') });
+    }
+    if (allow_register !== undefined) {
+      updates.push({ key: 'allow_register', value: allow_register ? '1' : '0' });
+    }
+    
+    for (const update of updates) {
+      await pool.query(
+        `INSERT INTO system_settings (\`key\`, \`value\`, updated_at) 
+         VALUES (?, ?, NOW())
+         ON DUPLICATE KEY UPDATE \`value\` = ?, updated_at = NOW()`,
+        [update.key, update.value, update.value]
+      );
+    }
+    
     res.json({
       code: 200,
       message: '面板设置已更新',
-      data: { panel_public_url: url }
+      data: null
     });
   } catch (err) {
     next(err);

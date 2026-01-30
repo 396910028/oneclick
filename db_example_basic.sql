@@ -23,6 +23,7 @@ DROP TABLE IF EXISTS `node_traffic`;
 DROP TABLE IF EXISTS `plan_nodes`;
 DROP TABLE IF EXISTS `ticket_replies`;
 DROP TABLE IF EXISTS `tickets`;
+DROP TABLE IF EXISTS `user_entitlements`;
 DROP TABLE IF EXISTS `orders`;
 DROP TABLE IF EXISTS `subscriptions`;
 DROP TABLE IF EXISTS `user_clients`;
@@ -169,6 +170,38 @@ CREATE TABLE `orders` (
   CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_orders_plan` FOREIGN KEY (`plan_id`) REFERENCES `plans` (`id`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单表';
+
+-- -----------------------------------------------------------------------------
+-- 3.1 用户权益表 user_entitlements（权威状态：当前套餐/到期/流量）
+-- -----------------------------------------------------------------------------
+CREATE TABLE `user_entitlements` (
+  `id` INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `user_id` INT NOT NULL COMMENT '用户ID',
+  `group_id` INT NOT NULL COMMENT '总套餐ID（外键 plan_groups.id）',
+  `plan_id` INT NOT NULL COMMENT '子套餐ID（外键 plans.id，用于节点权限 plan_nodes）',
+  `status` ENUM('active','cancelled','expired','exhausted') NOT NULL DEFAULT 'active' COMMENT '状态：active=有效,cancelled=已取消,expired=已过期,exhausted=流量耗尽',
+  `original_started_at` DATETIME NOT NULL COMMENT '原始开始时间（购买时的 paid_at）',
+  `original_expire_at` DATETIME NOT NULL COMMENT '原始到期时间（购买时计算的到期时间，不退订时与 service_expire_at 相同）',
+  `service_started_at` DATETIME NOT NULL COMMENT '实际服务开始时间（初始与 original_started_at 相同，部分退订可能调整）',
+  `service_expire_at` DATETIME NOT NULL COMMENT '实际服务到期时间（部分退订扣减天数时只改此字段，不动 original_expire_at）',
+  `traffic_total_bytes` BIGINT NOT NULL DEFAULT 0 COMMENT '该权益的流量配额（字节，0=无流量）',
+  `traffic_used_bytes` BIGINT NOT NULL DEFAULT 0 COMMENT '该权益已用流量（字节）',
+  `last_order_id` INT DEFAULT NULL COMMENT '最近一次影响该权益的订单ID（便于追溯）',
+  `cancel_reason` VARCHAR(255) DEFAULT NULL COMMENT '取消原因（如：全额退订、手动取消）',
+  `cancelled_at` DATETIME DEFAULT NULL COMMENT '取消时间',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_user_status` (`user_id`, `status`),
+  KEY `idx_user_group_status` (`user_id`, `group_id`, `status`),
+  KEY `idx_user_plan_status` (`user_id`, `plan_id`, `status`),
+  KEY `idx_service_expire_at` (`service_expire_at`),
+  KEY `idx_last_order_id` (`last_order_id`),
+  CONSTRAINT `fk_entitlements_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_entitlements_group` FOREIGN KEY (`group_id`) REFERENCES `plan_groups` (`id`) ON DELETE RESTRICT,
+  CONSTRAINT `fk_entitlements_plan` FOREIGN KEY (`plan_id`) REFERENCES `plans` (`id`) ON DELETE RESTRICT,
+  CONSTRAINT `fk_entitlements_order` FOREIGN KEY (`last_order_id`) REFERENCES `orders` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户权益表（权威状态：当前套餐/到期/流量）';
 
 -- -----------------------------------------------------------------------------
 -- 4. 工单表 tickets（/api/tickets、admin 工单管理）
