@@ -58,12 +58,14 @@ CREATE TABLE `plan_groups` (
   `level` INT NOT NULL DEFAULT 0 COMMENT '等级/优先级（越大可用节点越多，用于升级判断）',
   `is_exclusive` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否互斥：1=互斥（与其他互斥总套餐不能共存），0=可与其他总套餐共存',
   `status` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '状态：1=启用,0=停用',
+  `is_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否在套餐列表展示：1=展示，0=不展示（关则该总套餐下所有子套餐不在用户端套餐列表显示）',
   `sort_order` INT NOT NULL DEFAULT 0 COMMENT '排序顺序',
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   INDEX `idx_status` (`status`),
   INDEX `idx_level` (`level`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='总套餐表（套餐集合，不是可购买的套餐）';
+-- 若已有库无 is_public 字段，请执行：ALTER TABLE plan_groups ADD COLUMN is_public TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否在套餐列表展示' AFTER status;
 
 -- -----------------------------------------------------------------------------
 -- 2.2 子套餐表 plans（/api/plans、/api/orders、admin 套餐管理）
@@ -290,10 +292,10 @@ INSERT INTO `nodes` (`name`, `address`, `port`, `protocol`, `config`, `status`, 
 -- -----------------------------------------------------------------------------
 -- 11. 示例数据：plan_groups（总套餐集合）
 -- -----------------------------------------------------------------------------
-INSERT INTO `plan_groups` (`group_key`, `name`, `level`, `is_exclusive`, `status`, `sort_order`) VALUES
-('basic', '基础套餐', 0, 0, 1, 0),
-('pro', '高级套餐', 1, 0, 1, 1),
-('signin', '签到套餐', 0, 0, 1, 2);
+INSERT INTO `plan_groups` (`group_key`, `name`, `level`, `is_exclusive`, `status`, `is_public`, `sort_order`) VALUES
+('basic', '基础套餐', 0, 0, 1, 1, 0),
+('pro', '高级套餐', 1, 0, 1, 1, 1),
+('signin', '签到套餐', 0, 0, 1, 1, 2);
 
 -- -----------------------------------------------------------------------------
 -- 12. 示例数据：plans（子套餐，前端套餐列表、下单用）
