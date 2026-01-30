@@ -186,6 +186,7 @@ CREATE TABLE `user_entitlements` (
   `service_expire_at` DATETIME NOT NULL COMMENT '实际服务到期时间（部分退订扣减天数时只改此字段，不动 original_expire_at）',
   `traffic_total_bytes` BIGINT NOT NULL DEFAULT 0 COMMENT '该权益的流量配额（字节，0=无流量）',
   `traffic_used_bytes` BIGINT NOT NULL DEFAULT 0 COMMENT '该权益已用流量（字节）',
+  `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00 COMMENT '该权益累计支付金额（元，用于按剩余价值升级）',
   `last_order_id` INT DEFAULT NULL COMMENT '最近一次影响该权益的订单ID（便于追溯）',
   `cancel_reason` VARCHAR(255) DEFAULT NULL COMMENT '取消原因（如：全额退订、手动取消）',
   `cancelled_at` DATETIME DEFAULT NULL COMMENT '取消时间',

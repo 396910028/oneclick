@@ -88,19 +88,22 @@ async function updateUserEntitlementOnUnsubscribe(connection, userId, groupId, p
 }
 
 // 创建或更新用户权益（支付成功时调用）
-async function upsertUserEntitlement(connection, userId, groupId, planId, orderId, paidAt, durationDays, trafficAmount) {
+// 注意：此函数现在会同时维护 user_entitlements.total_amount，便于后续“按剩余价值升级”
+async function upsertUserEntitlement(connection, userId, groupId, planId, orderId, paidAt, durationDays, trafficAmount, orderAmount = 0) {
   const now = new Date(paidAt);
   const expireAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
   
   // 检查是否已存在同 group+plan 的 active 权益
   const [existing] = await connection.query(
-    `SELECT id, traffic_total_bytes, service_expire_at 
+    `SELECT id, traffic_total_bytes, service_expire_at, total_amount 
      FROM user_entitlements 
      WHERE user_id = ? AND group_id = ? AND plan_id = ? AND status = 'active' 
      LIMIT 1`,
     [userId, groupId, planId]
   );
   
+  const addAmount = Number(orderAmount || 0);
+
   if (existing.length > 0) {
     // 更新现有权益：延长到期时间，累加流量
     const existingEntitlement = existing[0];
@@ -114,6 +117,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
        SET original_expire_at = ?,
            service_expire_at = ?,
            traffic_total_bytes = traffic_total_bytes + ?,
+           total_amount = total_amount + ?,
            last_order_id = ?,
            updated_at = NOW()
        WHERE id = ?`,
@@ -121,6 +125,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
         newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
         newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
         trafficAmount,
+        addAmount,
         orderId,
         existingEntitlement.id
       ]
@@ -130,9 +135,9 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
     await connection.query(
       `INSERT INTO user_entitlements 
        (user_id, group_id, plan_id, status, original_started_at, original_expire_at, 
-        service_started_at, service_expire_at, traffic_total_bytes, traffic_used_bytes, 
+        service_started_at, service_expire_at, traffic_total_bytes, traffic_used_bytes, total_amount,
         last_order_id, created_at, updated_at)
-       VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, NOW(), NOW())`,
+       VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW())`,
       [
         userId,
         groupId,
@@ -142,6 +147,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
         paidAt.toISOString().slice(0, 19).replace('T', ' '),
         expireAt.toISOString().slice(0, 19).replace('T', ' '),
         trafficAmount,
+        addAmount,
         orderId
       ]
     );
@@ -712,6 +718,198 @@ router.get('/:id/upgrade-preview', auth, async (req, res, next) => {
   }
 });
 
+// 基于当前有效权益的升级预览（按剩余流量比例 × 累计金额计算残值）
+// GET /api/orders/upgrade-by-entitlement/preview?entitlement_id=xxx&new_plan_id=yyy
+router.get('/upgrade-by-entitlement/preview', auth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const entitlementId = Number(req.query.entitlement_id || 0);
+    const newPlanId = Number(req.query.new_plan_id || 0);
+
+    if (!entitlementId || !newPlanId) {
+      return res.status(400).json({
+        code: 400,
+        message: '参数不完整，必须提供 entitlement_id 和 new_plan_id',
+        data: null
+      });
+    }
+
+    // 1. 查找当前有效权益
+    const [entRows] = await pool.query(
+      `SELECT e.id,
+              e.user_id,
+              e.group_id,
+              e.plan_id,
+              e.original_started_at,
+              e.original_expire_at,
+              e.service_started_at,
+              e.service_expire_at,
+              e.total_amount,
+              pg.level AS group_level,
+              pg.name  AS group_name,
+              p.name   AS plan_name
+       FROM user_entitlements e
+       JOIN plan_groups pg ON e.group_id = pg.id
+       JOIN plans p ON e.plan_id = p.id
+       WHERE e.id = ? AND e.user_id = ? AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+       LIMIT 1`,
+      [entitlementId, userId]
+    );
+
+    if (entRows.length === 0) {
+      return res.status(404).json({
+        code: 404,
+        message: '指定的权益不存在或已失效',
+        data: null
+      });
+    }
+
+    const ent = entRows[0];
+
+    // 2. 查询新套餐
+    const [newPlanRows] = await pool.query(
+      `SELECT p.id, p.name, p.price, p.duration_days, p.status, p.is_public,
+              pg.level AS level
+       FROM plans p
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE p.id = ? LIMIT 1`,
+      [newPlanId]
+    );
+
+    if (newPlanRows.length === 0) {
+      return res.status(404).json({
+        code: 404,
+        message: '新套餐不存在',
+        data: null
+      });
+    }
+
+    const newPlan = newPlanRows[0];
+    if (newPlan.status !== 1 || newPlan.is_public !== 1) {
+      return res.status(400).json({
+        code: 400,
+        message: '新套餐未上架或已停用',
+        data: null
+      });
+    }
+
+    // 3. 等级校验：新总套餐等级必须 > 旧总套餐等级
+    const oldLevel = Number(ent.group_level || 0);
+    const newLevel = Number(newPlan.level || 0);
+    if (!Number.isNaN(oldLevel) && !Number.isNaN(newLevel) && newLevel <= oldLevel) {
+      return res.status(400).json({
+        code: 400,
+        message: '只能升级到更高级别的套餐',
+        data: null
+      });
+    }
+
+    // 4. 计算“该总套餐（group_id）”的剩余流量比例 + 累计金额
+    //   ratio = (group_remaining_traffic / group_total_traffic)
+    //   残值 = group_total_amount * ratio
+    const [aggRows] = await pool.query(
+      `SELECT
+          SUM(CASE WHEN e.traffic_total_bytes > 0 THEN e.traffic_total_bytes ELSE 0 END) AS total_traffic_bytes,
+          SUM(CASE WHEN e.traffic_total_bytes > 0 THEN LEAST(e.traffic_used_bytes, e.traffic_total_bytes) ELSE 0 END) AS used_traffic_bytes,
+          SUM(CASE WHEN e.total_amount > 0 THEN e.total_amount ELSE 0 END) AS total_amount
+       FROM user_entitlements e
+       WHERE e.user_id = ?
+         AND e.group_id = ?
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()`,
+      [userId, ent.group_id]
+    );
+
+    const agg = aggRows && aggRows.length ? aggRows[0] : {};
+    const groupTotalTraffic = Number(agg.total_traffic_bytes || 0);
+    const groupUsedTraffic = Number(agg.used_traffic_bytes || 0);
+    const groupAmount = Number(agg.total_amount || 0);
+
+    // 若总流量为 0（例如无流量套餐），无法按流量计算残值：直接视为无法升级（避免按时间兜底产生误解）
+    if (!groupTotalTraffic || groupTotalTraffic <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '旧套餐总流量为 0（无流量套餐），无法按流量计算残值',
+        data: null
+      });
+    }
+
+    const groupRemainingTraffic = Math.max(0, groupTotalTraffic - groupUsedTraffic);
+    const remainingRatio = groupRemainingTraffic / groupTotalTraffic;
+
+    // 旧套餐累计金额：优先用该总套餐累计金额；如果为 0，再退化为最近一笔已支付订单金额（避免历史数据未回填）
+    let baseAmount = groupAmount;
+    if (!baseAmount || baseAmount <= 0) {
+      const [lastPaid] = await pool.query(
+        `SELECT amount
+         FROM orders
+         WHERE user_id = ? AND status = 'paid'
+         ORDER BY COALESCE(paid_at, created_at) DESC, id DESC
+         LIMIT 1`,
+        [userId]
+      );
+      baseAmount = lastPaid.length ? Number(lastPaid[0].amount || 0) : 0;
+    }
+
+    if (!baseAmount || baseAmount <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '找不到可用于计算残值的订单金额，请联系客服处理',
+        data: null
+      });
+    }
+
+    const oldRemainingValue = baseAmount * remainingRatio;
+
+    // 5. 新套餐价格
+    const newAmount = Number(newPlan.price || 0);
+    if (!newAmount || newAmount <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '新套餐价格无效',
+        data: null
+      });
+    }
+
+    const needPay = newAmount - oldRemainingValue;
+    if (needPay < 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '旧套餐残值超过新套餐价格，请联系客服处理',
+        data: null
+      });
+    }
+
+    res.json({
+      code: 200,
+      message: 'success',
+      data: {
+        entitlement: {
+          id: ent.id,
+          plan_id: ent.plan_id,
+          plan_name: ent.plan_name,
+          group_name: ent.group_name,
+          original_started_at: ent.original_started_at,
+          original_expire_at: ent.original_expire_at,
+          service_expire_at: ent.service_expire_at,
+          total_amount: Number(baseAmount.toFixed(2))
+        },
+        newPlan: {
+          id: newPlan.id,
+          name: newPlan.name,
+          amount: newAmount,
+          duration_days: Number(newPlan.duration_days || 0)
+        },
+        oldRemainingValue: Number(oldRemainingValue.toFixed(2)),
+        needPay: Number(needPay.toFixed(2))
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/orders/:id/upgrade-confirm 确认升级并创建新订单
 router.post('/:id/upgrade-confirm', auth, async (req, res, next) => {
   try {
@@ -908,6 +1106,214 @@ router.post('/:id/upgrade-confirm', auth, async (req, res, next) => {
   }
 });
 
+// 基于当前有效权益的升级确认：创建一笔补差价订单（pending）
+// POST /api/orders/upgrade-by-entitlement/confirm { entitlement_id, new_plan_id, pay_method }
+router.post('/upgrade-by-entitlement/confirm', auth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const { entitlement_id, new_plan_id, pay_method = 'balance' } = req.body || {};
+
+    const entitlementId = Number(entitlement_id || 0);
+    const newPlanId = Number(new_plan_id || 0);
+
+    if (!entitlementId || !newPlanId) {
+      return res.status(400).json({
+        code: 400,
+        message: '参数不完整，必须提供 entitlement_id 和 new_plan_id',
+        data: null
+      });
+    }
+
+    // 1. 再次查当前权益，防止并发
+    const [entRows] = await pool.query(
+      `SELECT e.id,
+              e.user_id,
+              e.group_id,
+              e.plan_id,
+              e.original_started_at,
+              e.original_expire_at,
+              e.service_started_at,
+              e.service_expire_at,
+              e.total_amount,
+              pg.level AS group_level,
+              pg.name  AS group_name,
+              p.name   AS plan_name
+       FROM user_entitlements e
+       JOIN plan_groups pg ON e.group_id = pg.id
+       JOIN plans p ON e.plan_id = p.id
+       WHERE e.id = ? AND e.user_id = ? AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+       LIMIT 1`,
+      [entitlementId, userId]
+    );
+
+    if (entRows.length === 0) {
+      return res.status(404).json({
+        code: 404,
+        message: '指定的权益不存在或已失效',
+        data: null
+      });
+    }
+
+    const ent = entRows[0];
+
+    // 2. 新套餐
+    const [newPlanRows] = await pool.query(
+      `SELECT p.id, p.name, p.price, p.duration_days, p.status, p.is_public,
+              pg.level AS level
+       FROM plans p
+       JOIN plan_groups pg ON p.group_id = pg.id
+       WHERE p.id = ? LIMIT 1`,
+      [newPlanId]
+    );
+
+    if (newPlanRows.length === 0) {
+      return res.status(404).json({
+        code: 404,
+        message: '新套餐不存在',
+        data: null
+      });
+    }
+
+    const newPlan = newPlanRows[0];
+    if (newPlan.status !== 1 || newPlan.is_public !== 1) {
+      return res.status(400).json({
+        code: 400,
+        message: '新套餐未上架或已停用',
+        data: null
+      });
+    }
+
+    // 3. 等级约束：只能从低等级总套餐升级到高等级总套餐
+    const oldLevel = Number(ent.group_level || 0);
+    const newLevel = Number(newPlan.level || 0);
+    if (!Number.isNaN(oldLevel) && !Number.isNaN(newLevel) && newLevel <= oldLevel) {
+      return res.status(400).json({
+        code: 400,
+        message: '只能升级到更高级别的套餐',
+        data: null
+      });
+    }
+
+    // 4. 计算“该总套餐（group_id）”的剩余流量比例 + 累计金额
+    const [aggRows] = await pool.query(
+      `SELECT
+          SUM(CASE WHEN e.traffic_total_bytes > 0 THEN e.traffic_total_bytes ELSE 0 END) AS total_traffic_bytes,
+          SUM(CASE WHEN e.traffic_total_bytes > 0 THEN LEAST(e.traffic_used_bytes, e.traffic_total_bytes) ELSE 0 END) AS used_traffic_bytes,
+          SUM(CASE WHEN e.total_amount > 0 THEN e.total_amount ELSE 0 END) AS total_amount
+       FROM user_entitlements e
+       WHERE e.user_id = ?
+         AND e.group_id = ?
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()`,
+      [userId, ent.group_id]
+    );
+
+    const agg = aggRows && aggRows.length ? aggRows[0] : {};
+    const groupTotalTraffic = Number(agg.total_traffic_bytes || 0);
+    const groupUsedTraffic = Number(agg.used_traffic_bytes || 0);
+    const groupAmount = Number(agg.total_amount || 0);
+
+    if (!groupTotalTraffic || groupTotalTraffic <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '旧套餐总流量为 0（无流量套餐），无法按流量计算残值',
+        data: null
+      });
+    }
+
+    const groupRemainingTraffic = Math.max(0, groupTotalTraffic - groupUsedTraffic);
+    const remainingRatio = groupRemainingTraffic / groupTotalTraffic;
+
+    let baseAmount = groupAmount;
+    if (!baseAmount || baseAmount <= 0) {
+      const [lastPaid] = await pool.query(
+        `SELECT amount
+         FROM orders
+         WHERE user_id = ? AND status = 'paid'
+         ORDER BY COALESCE(paid_at, created_at) DESC, id DESC
+         LIMIT 1`,
+        [userId]
+      );
+      baseAmount = lastPaid.length ? Number(lastPaid[0].amount || 0) : 0;
+    }
+
+    if (!baseAmount || baseAmount <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '找不到可用于计算残值的订单金额，请联系客服处理',
+        data: null
+      });
+    }
+
+    const oldRemainingValue = baseAmount * remainingRatio;
+    const newAmount = Number(newPlan.price || 0);
+    if (!newAmount || newAmount <= 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '新套餐价格无效',
+        data: null
+      });
+    }
+
+    const needPay = newAmount - oldRemainingValue;
+    if (needPay < 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '旧套餐残值超过新套餐价格，请联系客服处理',
+        data: null
+      });
+    }
+
+    // 5. 检查是否有未支付订单
+    const [pendingOrders] = await pool.query(
+      `SELECT id, order_no
+       FROM orders
+       WHERE user_id = ? AND status = 'pending'
+       LIMIT 1`,
+      [userId]
+    );
+    if (pendingOrders.length > 0) {
+      return res.status(400).json({
+        code: 400,
+        message: '您有未支付的订单，请先支付或取消后再升级',
+        data: null
+      });
+    }
+
+    // 6. 创建升级订单（金额为需补金额，如果为 0 则免费）
+    const orderNo = `ORD${Date.now()}${Math.floor(Math.random() * 1000)
+      .toString()
+      .padStart(3, '0')}`;
+
+    const finalAmount = Number(needPay.toFixed(2));
+    const newDurationDays = Number(newPlan.duration_days || 30);
+
+    const insertSql = `INSERT INTO orders
+     (user_id, plan_id, order_no, amount, pay_method, status, order_type, duration_days, traffic_amount, created_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 'upgrade', ?, 0, UTC_TIMESTAMP())`;
+    const insertParams = [userId, newPlanId, orderNo, finalAmount, payMethod, newDurationDays];
+
+    const [result] = await pool.query(insertSql, insertParams);
+
+    res.json({
+      code: 200,
+      message: '升级订单创建成功',
+      data: {
+        id: result.insertId,
+        order_no: orderNo,
+        amount: finalAmount,
+        duration_days: newDurationDays,
+        status: 'pending',
+        entitlement_id: entitlementId,
+        old_remaining_value: Number(oldRemainingValue.toFixed(2))
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // 当前登录用户取消自己的订单（仅 pending/expired）
 router.post('/:id/cancel', auth, async (req, res, next) => {
   try {
@@ -1083,7 +1489,7 @@ router.post('/', auth, async (req, res, next) => {
       }
     }
 
-    const amount = Number(plan.price || 0);
+    let amount = Number(plan.price || 0);
 
     if (!amount || amount <= 0) {
       if (!isAdmin) {
@@ -1155,7 +1561,8 @@ router.post('/', auth, async (req, res, next) => {
           result.insertId,
           paidAt,
           durationDays,
-          trafficAmount
+          trafficAmount,
+          0
         );
       }
 

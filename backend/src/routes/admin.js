@@ -113,19 +113,22 @@ async function updateUserEntitlementOnUnsubscribe(connection, userId, groupId, p
 }
 
 // 创建或更新用户权益（支付成功时调用）
-async function upsertUserEntitlement(connection, userId, groupId, planId, orderId, paidAt, durationDays, trafficAmount) {
+// 注意：此函数会维护 user_entitlements.total_amount，便于后续按剩余价值升级
+async function upsertUserEntitlement(connection, userId, groupId, planId, orderId, paidAt, durationDays, trafficAmount, orderAmount = 0) {
   const now = new Date(paidAt);
   const expireAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
   
   // 检查是否已存在同 group+plan 的 active 权益
   const [existing] = await connection.query(
-    `SELECT id, traffic_total_bytes, service_expire_at 
+    `SELECT id, traffic_total_bytes, service_expire_at, total_amount 
      FROM user_entitlements 
      WHERE user_id = ? AND group_id = ? AND plan_id = ? AND status = 'active' 
      LIMIT 1`,
     [userId, groupId, planId]
   );
   
+  const addAmount = Number(orderAmount || 0);
+
   if (existing.length > 0) {
     // 更新现有权益：延长到期时间，累加流量
     const existingEntitlement = existing[0];
@@ -139,6 +142,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
        SET original_expire_at = ?,
            service_expire_at = ?,
            traffic_total_bytes = traffic_total_bytes + ?,
+           total_amount = total_amount + ?,
            last_order_id = ?,
            updated_at = NOW()
        WHERE id = ?`,
@@ -146,6 +150,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
         newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
         newExpireAt.toISOString().slice(0, 19).replace('T', ' '),
         trafficAmount,
+        addAmount,
         orderId,
         existingEntitlement.id
       ]
@@ -155,9 +160,9 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
     await connection.query(
       `INSERT INTO user_entitlements 
        (user_id, group_id, plan_id, status, original_started_at, original_expire_at, 
-        service_started_at, service_expire_at, traffic_total_bytes, traffic_used_bytes, 
+        service_started_at, service_expire_at, traffic_total_bytes, traffic_used_bytes, total_amount,
         last_order_id, created_at, updated_at)
-       VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, NOW(), NOW())`,
+       VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW())`,
       [
         userId,
         groupId,
@@ -167,6 +172,7 @@ async function upsertUserEntitlement(connection, userId, groupId, planId, orderI
         paidAt.toISOString().slice(0, 19).replace('T', ' '),
         expireAt.toISOString().slice(0, 19).replace('T', ' '),
         trafficAmount,
+        addAmount,
         orderId
       ]
     );
@@ -1262,7 +1268,7 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
     const { id } = req.params;
 
     const [rows] = await connection.query(
-      `SELECT o.id, o.user_id, o.status, o.plan_id
+      `SELECT o.id, o.user_id, o.status, o.plan_id, o.amount
        FROM orders o
        WHERE o.id = ? LIMIT 1`,
       [id]
@@ -1336,7 +1342,7 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
       );
     }
     
-    // 创建或更新用户权益
+    // 创建或更新用户权益（amount 用于累计 total_amount，便于以后按剩余价值升级）
     await upsertUserEntitlement(
       connection,
       order.user_id,
@@ -1345,7 +1351,8 @@ router.post('/orders/:id/force-pay', async (req, res, next) => {
       Number(id),
       paidAt,
       durationDays,
-      trafficLimit
+      trafficLimit,
+      Number(order.amount || 0)
     );
 
     await connection.commit();

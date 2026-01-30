@@ -75,7 +75,15 @@
     <template v-if="upgradePreview">
       <n-space vertical :size="12">
         <n-text>
-          您当前是 <strong>{{ upgradePreview.oldOrder.plan_name }}</strong> 套餐用户
+          您当前是
+          <strong>
+            {{
+              upgradePreview.entitlement
+                ? `${upgradePreview.entitlement.group_name || ''}${upgradePreview.entitlement.group_name ? ' - ' : ''}${upgradePreview.entitlement.plan_name}`
+                : '（未知）'
+            }}
+          </strong>
+          套餐用户
         </n-text>
         <n-text>
           旧套餐残值：<strong>¥{{ upgradePreview.oldRemainingValue }}</strong>
@@ -124,7 +132,12 @@ import {
 import { useAppStore } from '@/store/app';
 import { useUserStore } from '@/store/user';
 import { getPlans } from '@/api/plans';
-import { createOrder, getCurrentOrder, getUpgradePreview, confirmUpgrade } from '@/api/orders';
+import {
+  createOrder,
+  getCurrentOrder,
+  getUpgradePreviewByEntitlement,
+  confirmUpgradeByEntitlement
+} from '@/api/orders';
 
 const appStore = useAppStore();
 const userStore = useUserStore();
@@ -138,6 +151,8 @@ const pageSize = ref(6);
 const keyword = ref('');
 const loadingPlans = ref(false);
 const currentOrder = ref(null);
+// 当前“最高价值”的有效权益（来自 /api/orders/current 的第一条）
+const currentEntitlement = ref(null);
 const upgradePreview = ref(null);
 const showUpgradeModal = ref(false);
 const upgrading = ref(false);
@@ -191,7 +206,10 @@ async function fetchPlans() {
 async function fetchCurrentOrder() {
   try {
     const res = await getCurrentOrder();
-    currentOrder.value = res.data.current || null;
+    const data = res.data || {};
+    currentOrder.value = data.current || null;
+    const ents = Array.isArray(data.entitlements) ? data.entitlements : [];
+    currentEntitlement.value = ents.length ? ents[0] : null;
   } catch (err) {
     // 非关键接口，失败时保持 null
     currentOrder.value = null;
@@ -201,8 +219,8 @@ async function fetchCurrentOrder() {
 async function handleSubscribe(plan) {
   try {
     // 1. 检查是否是升级场景（当前有已支付订单且新套餐等级更高）
-    if (currentOrder.value && !isAdmin.value) {
-      const currentPlanLevel = Number(currentOrder.value.plan_level || 0);
+    if (currentEntitlement.value && !isAdmin.value) {
+      const currentPlanLevel = Number(currentEntitlement.value.plan_level || 0);
       const newPlanLevel = Number(plan.level || 0);
       if (newPlanLevel > currentPlanLevel) {
         // 走升级流程
@@ -232,9 +250,13 @@ async function handleSubscribe(plan) {
 
 async function handleUpgrade(plan) {
   try {
-    // 获取升级预览
-    const previewRes = await getUpgradePreview(
-      currentOrder.value.id,
+    if (!currentEntitlement.value) {
+      message.error('当前没有可用于升级的套餐权益');
+      return;
+    }
+    // 获取升级预览（按当前有效权益计算残值）
+    const previewRes = await getUpgradePreviewByEntitlement(
+      currentEntitlement.value.entitlement_id,
       plan.id
     );
     upgradePreview.value = previewRes.data;
@@ -257,8 +279,13 @@ async function confirmUpgradeOrder() {
 
   upgrading.value = true;
   try {
-    const res = await confirmUpgrade(
-      currentOrder.value.id,
+    if (!currentEntitlement.value) {
+      message.error('当前没有可用于升级的套餐权益');
+      upgrading.value = false;
+      return;
+    }
+    const res = await confirmUpgradeByEntitlement(
+      currentEntitlement.value.entitlement_id,
       upgradePreview.value.newPlan.id,
       'balance'
     );

@@ -252,25 +252,11 @@ router.post('/signin', authMiddleware, async (req, res, next) => {
     const newTrafficTotal =
       Number(user.traffic_total || 0) + Number(bonusBytes || 0);
 
-    // 4. 查找"签到套餐"的 plan_id（用于“没有任何套餐时”创建一个可退订的签到套餐）
-    const [signinPlanRows] = await connection.query(
-      `SELECT p.id AS plan_id
-       FROM plans p
-       JOIN plan_groups pg ON p.group_id = pg.id
-       WHERE pg.group_key = 'signin' AND p.status = 1
-       LIMIT 1`
-    );
-
-    let signinPlanId = null;
-    if (signinPlanRows.length > 0) {
-      signinPlanId = signinPlanRows[0].plan_id;
-    }
-
-    // 5. 处理签到权益：优先把奖励加到“时间价值最高”的现有套餐；没有任何套餐时创建一个签到套餐权益
+    // 4. 处理签到权益：必须已有套餐，否则不允许签到
     let planExtended = false;
     let planCreated = false;
 
-    // 5.1 查找用户当前有效权益（按 service_expire_at 从晚到早排，选最晚到期的那一个）
+    // 4.1 查找用户当前有效权益（按 service_expire_at 从晚到早排，选最晚到期的那一个）
     const [entRows] = await connection.query(
       `SELECT e.id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes
        FROM user_entitlements e
@@ -284,42 +270,31 @@ router.post('/signin', authMiddleware, async (req, res, next) => {
 
     const signinBonusMinutes = 10; // 签到奖励10分钟
 
-    if (entRows.length > 0) {
-      // 已有至少一个有效套餐：把签到奖励加到“时间价值最高”的那个权益上
-      const target = entRows[0];
-      await connection.query(
-        `UPDATE user_entitlements 
-         SET service_expire_at = DATE_ADD(service_expire_at, INTERVAL ? MINUTE),
-             traffic_total_bytes = traffic_total_bytes + ?,
-             updated_at = NOW()
-         WHERE id = ?`,
-        [signinBonusMinutes, bonusBytes, target.id]
-      );
-      planExtended = true;
-    } else if (signinPlanId) {
-      // 没有任何有效套餐：使用签到套餐 plan 创建一个新的权益（可在前端展示/管理员退订）
-      const start = now;
-      const expire = new Date(now.getTime() + signinBonusMinutes * 60 * 1000);
-      const startStr = start.toISOString().slice(0, 19).replace('T', ' ');
-      const expireStr = expire.toISOString().slice(0, 19).replace('T', ' ');
-
-      await connection.query(
-        `INSERT INTO user_entitlements 
-         (user_id, group_id, plan_id, status,
-          original_started_at, original_expire_at,
-          service_started_at, service_expire_at,
-          traffic_total_bytes, traffic_used_bytes,
-          last_order_id, created_at, updated_at)
-         SELECT ?, pg.id, p.id, 'active',
-                ?, ?, ?, ?, ?, 0, NULL, NOW(), NOW()
-         FROM plans p
-         JOIN plan_groups pg ON p.group_id = pg.id
-         WHERE p.id = ?
-         LIMIT 1`,
-        [userId, startStr, expireStr, startStr, expireStr, bonusBytes, signinPlanId]
-      );
-      planCreated = true;
+    if (entRows.length === 0) {
+      // 没有任何有效套餐：不允许签到（既不加流量，也不记签到记录）
+      await connection.rollback();
+      return res.status(400).json({
+        code: 400,
+        message: '当前没有可用套餐，无法签到',
+        data: {
+          todaySigned: false,
+          alreadySigned: false
+        }
+      });
     }
+
+    // 已有至少一个有效套餐：把签到奖励加到“时间价值最高”的那个权益上
+    const target = entRows[0];
+    await connection.query(
+      `UPDATE user_entitlements 
+       SET service_expire_at = DATE_ADD(service_expire_at, INTERVAL ? MINUTE),
+           traffic_total_bytes = traffic_total_bytes + ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [signinBonusMinutes, bonusBytes, target.id]
+    );
+    planExtended = true;
+    planCreated = false;
 
     // 7. 写入签到记录 & 更新用户表（放在同一事务中）
     await connection.query(
