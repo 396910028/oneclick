@@ -282,16 +282,22 @@ router.post('/report-traffic', requireInternalToken, async (req, res, next) => {
       [total, userId]
     );
 
-    // 1.1) 按策略分摊流量到 entitlements（优先消耗最早 service_expire_at 的权益）
+    // 1.1) 按策略分摊流量到 entitlements（仅扣“当前节点允许的权益”，优先消耗最早 service_expire_at）
     const [entitlementRows] = await pool.query(
-      `SELECT id, plan_id, traffic_total_bytes, traffic_used_bytes, service_expire_at
-       FROM user_entitlements
-       WHERE user_id = ? AND status = 'active' 
-         AND service_expire_at > NOW()
-         AND (traffic_total_bytes < 0 OR traffic_used_bytes < traffic_total_bytes)
-       ORDER BY service_expire_at ASC, id ASC`,
-      [userId]
+      `SELECT e.id, e.plan_id, e.traffic_total_bytes, e.traffic_used_bytes, e.service_expire_at
+       FROM user_entitlements e
+       JOIN plan_nodes pn ON pn.plan_id = e.plan_id AND pn.node_id = ?
+       WHERE e.user_id = ? AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+         AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
+       ORDER BY e.service_expire_at ASC, e.id ASC`,
+      [nodeId, userId]
     );
+
+    if (entitlementRows.length === 0) {
+      // 没有任何可用于该节点的权益：直接拒绝（避免把流量扣到其他套餐上）
+      return res.status(403).json({ code: 403, message: 'no_entitlement_for_node', data: null });
+    }
 
     let remainingTraffic = total;
     for (const e of entitlementRows) {

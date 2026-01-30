@@ -13,8 +13,8 @@ export function deleteAdminUser(id) {
 export function getAdminUserDetail(id) {
   return http.get(`/admin/users/${id}`);
 }
-export function getAdminUserRemaining(id) {
-  return http.get(`/admin/users/${id}/remaining`);
+export function getAdminUserRemaining(id, params) {
+  return http.get(`/admin/users/${id}/remaining`, { params });
 }
 export function postAdminUserUnsubscribe(userId, data) {
   return http.post(`/admin/users/${userId}/unsubscribe`, data);

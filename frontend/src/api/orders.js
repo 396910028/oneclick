@@ -31,8 +31,8 @@ export function confirmUpgrade(oldOrderId, newPlanId, payMethod = 'balance') {
   });
 }
 
-export function getOrderRemaining() {
-  return http.get('/orders/current/remaining');
+export function getOrderRemaining(params) {
+  return http.get('/orders/current/remaining', { params });
 }
 
 export function unsubscribeOrder(data) {

@@ -1,6 +1,7 @@
 <template>
   <n-space vertical size="large">
-    <n-grid :cols="appStore.gridCols" :x-gap="16" :y-gap="16">
+    <!-- 只有一个套餐时，用三个格子展示；多个套餐时，只用下面的列表展示 -->
+    <n-grid v-if="entitlements.length <= 1" :cols="appStore.gridCols" :x-gap="16" :y-gap="16">
       <n-gi>
         <n-card>
           <div class="stat-title">当前套餐</div>
@@ -24,6 +25,30 @@
         </n-card>
       </n-gi>
     </n-grid>
+
+    <n-card title="我的套餐（分开到期/分开计量）" v-if="entitlements.length">
+      <div class="traffic-table-wrapper">
+        <table class="traffic-table">
+          <thead>
+            <tr>
+              <th>套餐</th>
+              <th>到期</th>
+              <th>剩余流量</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in entitlements" :key="e.entitlement_id">
+              <td>{{ e.group_name ? `${e.group_name} - ${e.plan_name}` : e.plan_name }}</td>
+              <td>{{ formatDateTimeUtc8(e.expire_at) }}</td>
+              <td>
+                <span v-if="Number(e.traffic_remaining_bytes) <= 0">无流量</span>
+                <span v-else>{{ (Number(e.traffic_remaining_bytes) / 1073741824).toFixed(2) }} GB</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </n-card>
 
     <n-card title="每日签到">
       <n-space vertical :size="8">
@@ -158,6 +183,7 @@ const appStore = useAppStore();
 const route = useRoute();
 
 const currentOrder = ref(null);
+const entitlements = ref([]);
 const subscriptionToken = ref('');
 const userInfo = ref(null);
 const hasSignedToday = ref(false);
@@ -173,17 +199,18 @@ const trafficPoints = ref([]);
 let trafficTimer = null;
 
 const currentPlanText = computed(() => {
-  if (!currentOrder.value) {
-    return '暂无已生效套餐';
-  }
-  // 只展示套餐名称，不再区分月付/季付/年付，避免视觉上“降级/切换”的混淆
-  return currentOrder.value.plan_name || '已生效套餐';
+  if (!entitlements.value.length) return '暂无已生效套餐';
+  return entitlements.value.map((e) => e.plan_name).join('、');
 });
 
 const expireText = computed(() => {
-  if (!currentOrder.value || !currentOrder.value.expire_at) return '-';
+  if (!entitlements.value.length) return '-';
   try {
-    const raw = currentOrder.value.expire_at;
+    // 多套餐：展示“最近到期”的时间（详细分套餐到期在下方列表看）
+    const sorted = [...entitlements.value].sort(
+      (a, b) => new Date(a.expire_at).getTime() - new Date(b.expire_at).getTime()
+    );
+    const raw = sorted[0]?.expire_at;
     return formatDateTimeUtc8(raw);
   } catch (e) {
     console.error('格式化到期时间失败:', e);
@@ -192,24 +219,40 @@ const expireText = computed(() => {
 });
 
 const trafficText = computed(() => {
-  if (!userInfo.value) return '-';
-  const total = Number(userInfo.value.traffic_total || 0);
-  const used = Math.max(0, Number(userInfo.value.traffic_used || 0));
-  const usedGB = (used / 1073741824).toFixed(2);
-
-  // 不再使用“无限”文案：total <= 0 统一视为当前没有可用流量配额
-  if (!Number.isFinite(total) || total <= 0) {
-    return used > 0 ? `无流量（已用 ${usedGB}GB）` : '无流量';
+  // 改为按 entitlements 汇总展示（分开计量）
+  if (!entitlements.value.length) return '-';
+  
+  let totalRemaining = 0;
+  let totalUsed = 0;
+  let totalQuota = 0;
+  
+  for (const e of entitlements.value) {
+    const quota = Number(e.traffic_total_bytes || 0);
+    const used = Number(e.traffic_used_bytes || 0);
+    const remaining = quota < 0 ? -1 : Math.max(0, quota - used);
+    
+    if (quota >= 0) {
+      totalQuota += quota;
+      totalUsed += used;
+      if (remaining >= 0) {
+        totalRemaining += remaining;
+      }
+    }
   }
-
-  const remaining = Math.max(0, total - used);
-  const totalGB = (total / 1073741824).toFixed(2);
-  const remainingGB = (remaining / 1073741824).toFixed(2);
-  if (remaining <= 0) {
+  
+  if (totalQuota <= 0) {
+    return totalUsed > 0 ? `无流量（已用 ${(totalUsed / 1073741824).toFixed(2)}GB）` : '无流量';
+  }
+  
+  const totalQuotaGB = (totalQuota / 1073741824).toFixed(2);
+  const totalRemainingGB = (totalRemaining / 1073741824).toFixed(2);
+  const percent = Math.min(100, (totalUsed / totalQuota) * 100).toFixed(1);
+  
+  if (totalRemaining <= 0) {
     return '无流量';
   }
-  const percent = Math.min(100, (used / total) * 100).toFixed(1);
-  return `${remainingGB}GB / ${totalGB}GB (已用 ${percent}%)`;
+  
+  return `${totalRemainingGB}GB / ${totalQuotaGB}GB (已用 ${percent}%)`;
 });
 
 const shareUrl = ref('');
@@ -288,9 +331,11 @@ async function fetchCurrentPlan() {
   try {
     const res = await getCurrentOrder();
     currentOrder.value = res.data.current || null;
+    entitlements.value = res.data.entitlements || [];
   } catch (e) {
     // 总览非关键接口，失败时保持默认文案即可
     currentOrder.value = null;
+    entitlements.value = [];
   }
 }
 

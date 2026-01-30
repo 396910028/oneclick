@@ -109,12 +109,23 @@
         </n-space>
       </template>
     </n-modal>
-    <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订（扣减时长与流量）" style="width: 420px;">
+    <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订（扣减时长与流量）" style="width: 520px;">
       <n-form ref="unsubFormRef" :model="unsubForm" label-placement="left" label-width="120px">
         <n-alert v-if="unsubRemainingInfo" type="info" style="margin-bottom: 16px;">
           <div>剩余天数：{{ unsubRemainingInfo.remaining_days }} 天</div>
           <div>剩余流量：{{ unsubRemainingInfo.remaining_traffic_gb }} GB</div>
         </n-alert>
+        <n-form-item label="选择套餐" v-if="unsubRemainingInfo && unsubRemainingInfo.entitlements && unsubRemainingInfo.entitlements.length">
+          <n-select
+            v-model:value="selectedEntitlementId"
+            :options="unsubRemainingInfo.entitlements.map(e => ({
+              label: `${e.group_name || ''} - ${e.plan_name}（到期：${formatDateTimeUtc8(e.expire_at)}）`,
+              value: e.entitlement_id
+            }))"
+            placeholder="请选择要退订的套餐"
+            style="width: 100%;"
+          />
+        </n-form-item>
         <n-form-item label="退订方式">
           <n-radio-group v-model:value="unsubForm.refund_type">
             <n-radio value="full">全额退订（将扣减所有剩余天数和流量，套餐将失效）</n-radio>
@@ -165,6 +176,7 @@ import {
   NText,
   NRadioGroup,
   NRadio,
+  NSelect,
   useMessage
 } from 'naive-ui';
 import { getAdminUsers, getAdminUserDetail, getAdminUserRemaining, patchAdminUser, deleteAdminUser, postAdminUserUnsubscribe } from '@/api/admin';
@@ -340,6 +352,7 @@ const unsubForm = ref({ duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '
 const unsubFormRef = ref(null);
 const unsubLoading = ref(false);
 const unsubRemainingInfo = ref(null);
+const selectedEntitlementId = ref(null);
 let unsubUserId = null;
 
 const showEditModal = ref(false);
@@ -372,6 +385,7 @@ async function openUnsubscribeModal(user) {
   unsubUserId = user.id;
   unsubForm.value = { duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '', refund_type: 'partial' };
   unsubRemainingInfo.value = null;
+  selectedEntitlementId.value = null;
   try {
     const res = await getAdminUserRemaining(user.id);
     unsubRemainingInfo.value = res.data || null;
@@ -379,12 +393,33 @@ async function openUnsubscribeModal(user) {
       message.warning('该用户当前没有可退订的套餐');
       return;
     }
+    if (unsubRemainingInfo.value.entitlements && unsubRemainingInfo.value.entitlements.length) {
+      selectedEntitlementId.value = unsubRemainingInfo.value.entitlements[0].entitlement_id;
+      // 拉取该权益的剩余（用于 full refund 自动填充）
+      const res2 = await getAdminUserRemaining(user.id, { entitlement_id: selectedEntitlementId.value });
+      unsubRemainingInfo.value = res2.data || unsubRemainingInfo.value;
+    }
   } catch (e) {
     message.error(e.message || '获取剩余信息失败');
     return;
   }
   showUnsubscribeModal.value = true;
 }
+
+watch(() => selectedEntitlementId.value, async (id) => {
+  if (!id || !unsubUserId) return;
+  try {
+    const res = await getAdminUserRemaining(unsubUserId, { entitlement_id: id });
+    unsubRemainingInfo.value = res.data || unsubRemainingInfo.value;
+    // 如果当前是全额退订，切换套餐后也要刷新自动填充
+    if (unsubForm.value.refund_type === 'full' && unsubRemainingInfo.value) {
+      unsubForm.value.duration_days_deduct = unsubRemainingInfo.value.remaining_days || 0;
+      unsubForm.value.traffic_gb_deduct = parseFloat(unsubRemainingInfo.value.remaining_traffic_gb || 0);
+    }
+  } catch (e) {
+    message.error(e.message || '获取剩余信息失败');
+  }
+});
 
 // 监听退订方式，全额退订时自动填入剩余天数和流量
 watch(() => unsubForm.value.refund_type, (type) => {
@@ -405,9 +440,14 @@ async function submitUnsubscribe() {
     message.warning('请填写扣减天数或扣减流量至少一项，或选择全额退订');
     return;
   }
+  if (!selectedEntitlementId.value) {
+    message.warning('请选择要退订的套餐');
+    return;
+  }
   unsubLoading.value = true;
   try {
     const res = await postAdminUserUnsubscribe(unsubUserId, {
+      entitlement_id: selectedEntitlementId.value,
       duration_days_deduct: d,
       traffic_gb_deduct: g,
       remark: (unsubForm.value.remark || '').trim(),

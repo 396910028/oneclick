@@ -367,41 +367,46 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- -----------------------------------------------------------------------------
 -- 示例数据：plan_groups
 -- -----------------------------------------------------------------------------
-INSERT INTO `plan_groups` (`group_key`, `name`, `level`, `is_exclusive`, `status`, `is_public`, `sort_order`, `connections`, `speed_limit`) VALUES
-('basic', '基础套餐', 0, 0, 1, 1, 0, 3, 100),
-('pro', '高级套餐', 1, 0, 1, 1, 1, 5, 300),
-('signin', '签到套餐', 0, 0, 1, 1, 2, 1, 0);
+INSERT INTO `plan_groups` (`id`, `group_key`, `name`, `level`, `is_exclusive`, `connections`, `speed_limit`, `status`, `is_public`, `sort_order`) VALUES
+(1, 'basic',  '基础套餐', 0, 1, 2,  50, 1, 1, 0),
+(2, 'pro',    '高级套餐', 1, 1, 3, 150, 1, 1, 1),
+(3, 'signin', '签到套餐', 0, 0, 1,   0, 1, 1, 2),
+(4, 'vip',    '单VIP节点', 0, 0, 1, 200, 1, 1, 3);
 
 -- -----------------------------------------------------------------------------
 -- 示例数据：plans（子套餐）
--- 流量：100GB=107374182400 字节，300GB=322122547200 字节
+-- 流量换算：GB * 1024^3
 -- -----------------------------------------------------------------------------
 INSERT INTO `plans` (
-  `group_id`, `name`, `description`,
+  `id`, `group_id`, `name`, `description`,
   `price`, `duration_days`,
   `traffic_limit`, `speed_limit`, `connections`,
   `is_public`, `status`
 ) VALUES
-((SELECT id FROM plan_groups WHERE group_key = 'basic' LIMIT 1), '基础套餐-月', '适合轻度使用，100GB，100Mbps，3 设备（30 天）',
+(1, 1, '100G双终端包月', '基础套餐 100GB 双终端 月付',
   19.90, 30,
-  107374182400, 100, 3,
+  107374182400, 0, 1,
   1, 1),
-((SELECT id FROM plan_groups WHERE group_key = 'basic' LIMIT 1), '基础套餐-年', '适合轻度使用，1200GB，100Mbps，3 设备（365 天）',
+(2, 1, '1200G双终端包年', '基础套餐 1200GB 双终端 年付',
   199.00, 365,
-  1288490188800, 100, 3,
+  1288490188800, 0, 1,
   1, 1),
-((SELECT id FROM plan_groups WHERE group_key = 'pro' LIMIT 1), '高级套餐-月', '重度使用，300GB，300Mbps，5 设备（30 天）',
+(3, 2, '300G多终端包月', '高级套餐 300GB 多终端 月付',
   39.90, 30,
-  322122547200, 300, 5,
+  322122547200, 0, 1,
   1, 1),
-((SELECT id FROM plan_groups WHERE group_key = 'pro' LIMIT 1), '高级套餐-年', '重度使用，3600GB，300Mbps，5 设备（365 天）',
+(4, 2, '3600G多终端包年', '高级套餐 3600GB 多终端 年付',
   299.00, 365,
-  3865470566400, 300, 5,
+  3865470566400, 0, 1,
   1, 1),
-((SELECT id FROM plan_groups WHERE group_key = 'signin' LIMIT 1), '签到奖励-10分钟', '每日签到奖励，有效期10分钟，流量随签到奖励动态计算',
+(5, 3, '签到奖励-10分钟', '签到奖励：无流量（仅时长）',
   0.00, 1,
   0, 0, 1,
-  0, 1);
+  0, 1),
+(6, 4, '单VIP节点 2000G多终端包月', '单VIP节点 2000GB 多终端 月付',
+  59.90, 30,
+  2147483648000, 0, 1,
+  1, 1);
 
 -- -----------------------------------------------------------------------------
 -- 示例数据：nodes

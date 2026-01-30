@@ -13,12 +13,23 @@
       @update:page="fetchOrders"
       @update:page-size="fetchOrders"
     />
-    <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订" style="width: 420px;">
+    <n-modal v-model:show="showUnsubscribeModal" preset="card" title="退订" style="width: 520px;">
       <n-form ref="unsubFormRef" :model="unsubForm" label-placement="left" label-width="120px">
         <n-alert v-if="remainingInfo" type="info" style="margin-bottom: 16px;">
           <div>剩余天数：{{ remainingInfo.remaining_days }} 天</div>
           <div>剩余流量：{{ remainingInfo.remaining_traffic_gb }} GB</div>
         </n-alert>
+        <n-form-item label="选择套餐" v-if="remainingInfo && remainingInfo.entitlements && remainingInfo.entitlements.length">
+          <n-select
+            v-model:value="selectedEntitlementId"
+            :options="remainingInfo.entitlements.map(e => ({
+              label: `${e.group_name || ''} - ${e.plan_name}（到期：${formatDateTimeUtc8(e.expire_at)}）`,
+              value: e.entitlement_id
+            }))"
+            placeholder="请选择要退订的套餐"
+            style="width: 100%;"
+          />
+        </n-form-item>
         <n-form-item label="退订方式">
           <n-radio-group v-model:value="unsubForm.refund_type">
             <n-radio value="full">全额退订（将扣减所有剩余天数和流量，套餐将失效）</n-radio>
@@ -47,7 +58,7 @@
 
 <script setup>
 import { ref, computed, onMounted, watch, h } from 'vue';
-import { NCard, NDataTable, NPagination, NTag, NButton, NPopconfirm, NModal, NForm, NFormItem, NInputNumber, NInput, NRadioGroup, NRadio, useMessage } from 'naive-ui';
+import { NCard, NDataTable, NPagination, NTag, NButton, NPopconfirm, NModal, NForm, NFormItem, NInputNumber, NInput, NRadioGroup, NRadio, NSelect, useMessage } from 'naive-ui';
 import { getOrders, cancelOrder, getOrderRemaining, unsubscribeOrder } from '@/api/orders';
 import { formatDateTimeUtc8 } from '@/utils/datetime';
 
@@ -64,6 +75,7 @@ const unsubForm = ref({ duration_days_deduct: 0, traffic_gb_deduct: 0, remark: '
 const unsubFormRef = ref(null);
 const unsubLoading = ref(false);
 const remainingInfo = ref(null);
+const selectedEntitlementId = ref(null);
 
 const pageCount = computed(() => Math.ceil(total.value / pageSize.value) || 1);
 
@@ -259,6 +271,12 @@ async function openUnsubscribeModal() {
       message.warning('您当前没有可退订的套餐');
       return;
     }
+    if (remainingInfo.value.entitlements && remainingInfo.value.entitlements.length) {
+      selectedEntitlementId.value = remainingInfo.value.entitlements[0].entitlement_id;
+      // 拉取该权益的剩余（用于 full refund 自动填充）
+      const res2 = await getOrderRemaining({ entitlement_id: selectedEntitlementId.value });
+      remainingInfo.value = res2.data || remainingInfo.value;
+    }
     unsubForm.value = {
       duration_days_deduct: 0,
       traffic_gb_deduct: 0,
@@ -270,6 +288,21 @@ async function openUnsubscribeModal() {
     message.error(e.message || '获取剩余信息失败');
   }
 }
+
+watch(() => selectedEntitlementId.value, async (id) => {
+  if (!id) return;
+  try {
+    const res = await getOrderRemaining({ entitlement_id: id });
+    remainingInfo.value = res.data || remainingInfo.value;
+    // 如果当前是全额退订，切换套餐后也要刷新自动填充
+    if (unsubForm.value.refund_type === 'full' && remainingInfo.value) {
+      unsubForm.value.duration_days_deduct = remainingInfo.value.remaining_days || 0;
+      unsubForm.value.traffic_gb_deduct = parseFloat(remainingInfo.value.remaining_traffic_gb || 0);
+    }
+  } catch (e) {
+    message.error(e.message || '获取剩余信息失败');
+  }
+});
 
 // 监听退订方式，全额退订时自动填入剩余天数和流量
 watch(() => unsubForm.value.refund_type, (type) => {
@@ -290,9 +323,14 @@ async function submitUnsubscribe() {
     message.warning('请填写扣减天数或扣减流量至少一项，或选择全额退订');
     return;
   }
+  if (!selectedEntitlementId.value) {
+    message.warning('请选择要退订的套餐');
+    return;
+  }
   unsubLoading.value = true;
   try {
     const res = await unsubscribeOrder({
+      entitlement_id: selectedEntitlementId.value,
       duration_days_deduct: d,
       traffic_gb_deduct: g,
       remark: (unsubForm.value.remark || '').trim(),

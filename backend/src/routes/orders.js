@@ -230,10 +230,17 @@ router.get('/current', auth, async (req, res, next) => {
     // 先刷新状态（请求时兜底）
     await refreshUserEntitlementStatus(userId);
 
-    // 从 user_entitlements 获取用户有效权益（取最晚到期且剩余流量最多的作为主展示）
+    // 返回所有有效权益（用于前端展示“多个套餐分别到期/分别剩余”）
     const [entitlementRows] = await pool.query(
-      `SELECT e.id, e.plan_id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes,
-              p.id AS plan_id, p.name AS plan_name, pg.level AS plan_level
+      `SELECT e.id,
+              e.group_id,
+              e.plan_id,
+              e.service_expire_at,
+              e.traffic_total_bytes,
+              e.traffic_used_bytes,
+              pg.name AS group_name,
+              pg.level AS plan_level,
+              p.name AS plan_name
        FROM user_entitlements e
        JOIN plans p ON e.plan_id = p.id
        JOIN plan_groups pg ON e.group_id = pg.id
@@ -241,42 +248,58 @@ router.get('/current', auth, async (req, res, next) => {
          AND e.status = 'active'
          AND e.service_expire_at > NOW()
          AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
-       ORDER BY e.service_expire_at DESC, (e.traffic_total_bytes - e.traffic_used_bytes) DESC
-       LIMIT 1`,
+       ORDER BY e.service_expire_at DESC, (e.traffic_total_bytes - e.traffic_used_bytes) DESC`,
       [userId]
     );
 
-    let current = null;
-    if (entitlementRows.length > 0) {
-      const e = entitlementRows[0];
-      current = {
-        id: e.id,
+    const entitlements = entitlementRows.map((e) => {
+      const total = Number(e.traffic_total_bytes || 0);
+      const used = Number(e.traffic_used_bytes || 0);
+      const remaining = total < 0 ? -1 : Math.max(0, total - used);
+      return {
+        entitlement_id: e.id,
+        group_id: e.group_id,
+        group_name: e.group_name,
         plan_id: e.plan_id,
         plan_name: e.plan_name,
         plan_level: e.plan_level,
-        expire_at: e.service_expire_at
+        expire_at: e.service_expire_at,
+        traffic_total_bytes: total,
+        traffic_used_bytes: used,
+        traffic_remaining_bytes: remaining
       };
-    }
+    });
+
+    // 兼容旧前端：仍给一个 current（取第一条）
+    const current = entitlements.length
+      ? {
+          id: entitlements[0].entitlement_id,
+          plan_id: entitlements[0].plan_id,
+          plan_name: entitlements[0].plan_name,
+          plan_level: entitlements[0].plan_level,
+          expire_at: entitlements[0].expire_at
+        }
+      : null;
 
     res.json({
       code: 200,
       message: 'success',
-      data: { current }
+      data: { current, entitlements }
     });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/orders/current/remaining 获取当前套餐剩余天数和流量（用于退订，从 user_entitlements 读取）
+// GET /api/orders/current/remaining 获取“可退订权益”的剩余（支持 entitlement_id 指定某个权益）
 router.get('/current/remaining', auth, async (req, res, next) => {
   try {
     const userId = req.user.id;
+    const entitlementId = req.query.entitlement_id ? Number(req.query.entitlement_id) : null;
     
     // 先刷新状态（请求时兜底）
     await refreshUserEntitlementStatus(userId);
 
-    // 从 user_entitlements 获取用户有效权益
     const [entitlementRows] = await pool.query(
       `SELECT e.id, e.group_id, e.plan_id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes,
               pg.name AS group_name, p.name AS plan_name
@@ -305,40 +328,42 @@ router.get('/current/remaining', auth, async (req, res, next) => {
       });
     }
 
-    // 计算总剩余天数和流量（取最晚到期的权益）
+    // 计算每个权益的剩余（用于前端选择“退订哪个”）
     const now = new Date();
-    let maxRemainingDays = 0;
-    let maxRemainingTraffic = 0;
-    let currentPlanInfo = null;
-
-    for (const e of entitlementRows) {
+    const items = entitlementRows.map((e) => {
       const expireAt = new Date(e.service_expire_at);
       const remainingDays = expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
-      const remainingTraffic = e.traffic_total_bytes < 0 
-        ? Number.MAX_SAFE_INTEGER 
-        : Math.max(0, Number(e.traffic_total_bytes || 0) - Number(e.traffic_used_bytes || 0));
-      
-      if (remainingDays > maxRemainingDays || (remainingDays === maxRemainingDays && remainingTraffic > maxRemainingTraffic)) {
-        maxRemainingDays = remainingDays;
-        maxRemainingTraffic = remainingTraffic;
-        currentPlanInfo = {
-          group_id: e.group_id,
-          group_name: e.group_name,
-          plan_name: e.plan_name,
-          expire_at: e.service_expire_at
-        };
-      }
-    }
+      const totalBytes = Number(e.traffic_total_bytes || 0);
+      const usedBytes = Number(e.traffic_used_bytes || 0);
+      const remainingTrafficBytes = totalBytes < 0 ? -1 : Math.max(0, totalBytes - usedBytes);
+      return {
+        entitlement_id: e.id,
+        group_id: e.group_id,
+        group_name: e.group_name,
+        plan_id: e.plan_id,
+        plan_name: e.plan_name,
+        expire_at: e.service_expire_at,
+        remaining_days: remainingDays,
+        remaining_traffic_bytes: remainingTrafficBytes,
+        remaining_traffic_gb: remainingTrafficBytes < 0 ? '-1' : (remainingTrafficBytes / (1024 ** 3)).toFixed(2)
+      };
+    });
+
+    const target = entitlementId ? items.find((x) => x.entitlement_id === entitlementId) : items[0];
 
     res.json({
       code: 200,
       message: 'success',
       data: {
-        remaining_days: maxRemainingDays,
-        remaining_traffic_bytes: maxRemainingTraffic,
-        remaining_traffic_gb: (maxRemainingTraffic / (1024 ** 3)).toFixed(2),
-        current_plan: currentPlanInfo,
-        can_unsubscribe: maxRemainingDays > 0 || maxRemainingTraffic > 0
+        // 兼容旧前端：仍返回单个 remaining/current_plan（默认第一条，或按 entitlement_id 指定）
+        remaining_days: target?.remaining_days || 0,
+        remaining_traffic_bytes: target?.remaining_traffic_bytes || 0,
+        remaining_traffic_gb: target?.remaining_traffic_gb || '0.00',
+        current_plan: target
+          ? { group_id: target.group_id, group_name: target.group_name, plan_name: target.plan_name, expire_at: target.expire_at }
+          : null,
+        can_unsubscribe: !!target && ((target.remaining_days || 0) > 0 || (target.remaining_traffic_bytes || 0) > 0),
+        entitlements: items
       }
     });
   } catch (err) {
@@ -351,7 +376,7 @@ router.post('/unsubscribe', auth, async (req, res, next) => {
   const connection = await pool.getConnection();
   try {
     const userId = req.user.id;
-    const { duration_days_deduct = 0, traffic_gb_deduct = 0, remark = '', full_refund = false } = req.body;
+    const { entitlement_id, duration_days_deduct = 0, traffic_gb_deduct = 0, remark = '', full_refund = false } = req.body;
 
     const daysDeduct = Math.max(0, Number(duration_days_deduct) || 0);
     const gbDeduct = Math.max(0, Number(traffic_gb_deduct) || 0);
@@ -366,7 +391,12 @@ router.post('/unsubscribe', auth, async (req, res, next) => {
       });
     }
 
-    // 从 user_entitlements 获取用户当前有效权益
+    // 从 user_entitlements 获取用户当前有效权益（必须按 entitlement_id 精确退订某一个）
+    if (!entitlement_id) {
+      connection.release();
+      return res.status(400).json({ code: 400, message: '请先选择要退订的套餐（entitlement_id）', data: null });
+    }
+
     const [entitlementRows] = await connection.query(
       `SELECT e.id, e.group_id, e.plan_id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes,
               pg.name AS group_name, p.name AS plan_name
@@ -376,8 +406,9 @@ router.post('/unsubscribe', auth, async (req, res, next) => {
        WHERE e.user_id = ? AND e.status = 'active' 
          AND e.service_expire_at > NOW()
          AND (e.traffic_total_bytes < 0 OR e.traffic_used_bytes < e.traffic_total_bytes)
-       ORDER BY e.service_expire_at DESC`,
-      [userId]
+         AND e.id = ?
+       LIMIT 1`,
+      [userId, Number(entitlement_id)]
     );
 
     if (entitlementRows.length === 0) {
@@ -389,28 +420,14 @@ router.post('/unsubscribe', auth, async (req, res, next) => {
       });
     }
 
-    // 计算总剩余天数和流量（取最晚到期的权益）
+    // 计算该权益剩余天数和流量
     const now = new Date();
-    let maxRemainingDays = 0;
-    let maxRemainingTraffic = 0;
-    let targetEntitlement = null;
-    
-    for (const e of entitlementRows) {
-      const expireAt = new Date(e.service_expire_at);
-      const remainingDays = expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
-      const remainingTraffic = e.traffic_total_bytes < 0 
-        ? Number.MAX_SAFE_INTEGER 
-        : Math.max(0, Number(e.traffic_total_bytes || 0) - Number(e.traffic_used_bytes || 0));
-      
-      if (remainingDays > maxRemainingDays || (remainingDays === maxRemainingDays && remainingTraffic > maxRemainingTraffic)) {
-        maxRemainingDays = remainingDays;
-        maxRemainingTraffic = remainingTraffic;
-        targetEntitlement = e;
-      }
-    }
-    
-    const remainingDays = maxRemainingDays;
-    const remainingTraffic = maxRemainingTraffic;
+    const targetEntitlement = entitlementRows[0];
+    const expireAt = new Date(targetEntitlement.service_expire_at);
+    const remainingDays = expireAt > now ? Math.max(0, Math.floor((expireAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+    const totalBytes = Number(targetEntitlement.traffic_total_bytes || 0);
+    const usedBytes = Number(targetEntitlement.traffic_used_bytes || 0);
+    const remainingTraffic = totalBytes < 0 ? Number.MAX_SAFE_INTEGER : Math.max(0, totalBytes - usedBytes);
 
     let finalDaysDeduct = daysDeduct;
     let finalTrafficDeduct = trafficBytesDeduct;

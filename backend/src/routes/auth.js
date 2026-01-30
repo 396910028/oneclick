@@ -252,7 +252,7 @@ router.post('/signin', authMiddleware, async (req, res, next) => {
     const newTrafficTotal =
       Number(user.traffic_total || 0) + Number(bonusBytes || 0);
 
-    // 4. 查找"签到套餐"的 plan_id
+    // 4. 查找"签到套餐"的 plan_id（用于“没有任何套餐时”创建一个可退订的签到套餐）
     const [signinPlanRows] = await connection.query(
       `SELECT p.id AS plan_id
        FROM plans p
@@ -266,87 +266,59 @@ router.post('/signin', authMiddleware, async (req, res, next) => {
       signinPlanId = signinPlanRows[0].plan_id;
     }
 
-    // 5. 处理套餐：检查用户是否有有效套餐
-    let hasActivePlan = false;
-    let currentExpireAt = null;
+    // 5. 处理签到权益：优先把奖励加到“时间价值最高”的现有套餐；没有任何套餐时创建一个签到套餐权益
+    let planExtended = false;
+    let planCreated = false;
 
-    if (signinPlanId) {
-      // 查询用户当前所有已支付订单，计算是否有有效套餐
-      const [orderRows] = await connection.query(
-        `SELECT o.id, o.plan_id, o.duration_days, o.paid_at, o.created_at,
-                p.id AS plan_id, pg.group_key
-         FROM orders o
-         JOIN plans p ON o.plan_id = p.id
-         JOIN plan_groups pg ON p.group_id = pg.id
-         WHERE o.user_id = ? AND o.status = 'paid'
-         ORDER BY COALESCE(o.paid_at, o.created_at) ASC, o.id ASC`,
-        [userId]
-      );
+    // 5.1 查找用户当前有效权益（按 service_expire_at 从晚到早排，选最晚到期的那一个）
+    const [entRows] = await connection.query(
+      `SELECT e.id, e.service_expire_at, e.traffic_total_bytes, e.traffic_used_bytes
+       FROM user_entitlements e
+       WHERE e.user_id = ? 
+         AND e.status = 'active'
+         AND e.service_expire_at > NOW()
+       ORDER BY e.service_expire_at DESC
+       LIMIT 1`,
+      [userId]
+    );
 
-      if (orderRows.length > 0) {
-        // 按套餐分组，计算每个套餐的到期时间
-        const byPlan = new Map();
-        for (const o of orderRows) {
-          if (!byPlan.has(o.plan_id)) byPlan.set(o.plan_id, []);
-          byPlan.get(o.plan_id).push(o);
-        }
+    const signinBonusMinutes = 10; // 签到奖励10分钟
 
-        // 找出所有有效套餐的到期时间
-        const activeExpires = [];
-        for (const [planId, orders] of byPlan.entries()) {
-          let accExpire = null;
-          for (const o of orders) {
-            const baseStr = o.paid_at || o.created_at;
-            if (!baseStr) continue;
-            const base = new Date(baseStr);
-            const start = accExpire && accExpire > base ? accExpire : base;
-            const durationDays = Number(o.duration_days || 0);
-            if (durationDays <= 0) continue;
-            const expire = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
-            accExpire = expire;
-          }
-          if (accExpire && accExpire > now) {
-            activeExpires.push(accExpire);
-            hasActivePlan = true;
-          }
-        }
-
-        // 取最晚的到期时间作为当前到期时间
-        if (activeExpires.length > 0) {
-          currentExpireAt = new Date(Math.max(...activeExpires.map((e) => e.getTime())));
-        }
-      }
-
-      // 6. 创建签到订单（延长套餐10分钟或创建新套餐）
-      const signinDurationDays = 1; // 1天
-      const signinBonusMinutes = 10; // 签到奖励10分钟
-      const signinBonusMs = signinBonusMinutes * 60 * 1000; // 10分钟的毫秒数
-      const oneDayMs = 24 * 60 * 60 * 1000; // 1天的毫秒数
-
-      let signinPaidAt;
-      if (hasActivePlan && currentExpireAt) {
-        // 已有套餐：延长10分钟
-        // paid_at 设置为：当前到期时间 - (1天 - 10分钟)
-        // 这样 paid_at + 1天 = 当前到期时间 + 10分钟
-        signinPaidAt = new Date(currentExpireAt.getTime() - (oneDayMs - signinBonusMs));
-      } else {
-        // 没有套餐：创建新套餐，有效期10分钟
-        // paid_at 设置为：当前时间 - (1天 - 10分钟)
-        // 这样 paid_at + 1天 = 当前时间 + 10分钟
-        signinPaidAt = new Date(now.getTime() - (oneDayMs - signinBonusMs));
-      }
-
-      // 生成订单号
-      const orderNo = `SIGNIN${Date.now()}${Math.floor(Math.random() * 1000)}`;
-
-      // 创建签到订单（自动已支付，金额为0，pay_method 复用 balance，避免 ENUM 截断）
+    if (entRows.length > 0) {
+      // 已有至少一个有效套餐：把签到奖励加到“时间价值最高”的那个权益上
+      const target = entRows[0];
       await connection.query(
-        `INSERT INTO orders (user_id, order_no, plan_id, amount, status, pay_method, duration_days, paid_at, created_at)
-         VALUES (?, ?, ?, 0.00, 'paid', 'balance', ?, ?, NOW())`,
-        [userId, orderNo, signinPlanId, signinDurationDays, signinPaidAt]
+        `UPDATE user_entitlements 
+         SET service_expire_at = DATE_ADD(service_expire_at, INTERVAL ? MINUTE),
+             traffic_total_bytes = traffic_total_bytes + ?,
+             updated_at = NOW()
+         WHERE id = ?`,
+        [signinBonusMinutes, bonusBytes, target.id]
       );
+      planExtended = true;
+    } else if (signinPlanId) {
+      // 没有任何有效套餐：使用签到套餐 plan 创建一个新的权益（可在前端展示/管理员退订）
+      const start = now;
+      const expire = new Date(now.getTime() + signinBonusMinutes * 60 * 1000);
+      const startStr = start.toISOString().slice(0, 19).replace('T', ' ');
+      const expireStr = expire.toISOString().slice(0, 19).replace('T', ' ');
 
-      // 如果签到套餐有流量配额，也累加到用户流量（但这里我们让流量单独处理，套餐只负责时间）
+      await connection.query(
+        `INSERT INTO user_entitlements 
+         (user_id, group_id, plan_id, status,
+          original_started_at, original_expire_at,
+          service_started_at, service_expire_at,
+          traffic_total_bytes, traffic_used_bytes,
+          last_order_id, created_at, updated_at)
+         SELECT ?, pg.id, p.id, 'active',
+                ?, ?, ?, ?, ?, 0, NULL, NOW(), NOW()
+         FROM plans p
+         JOIN plan_groups pg ON p.group_id = pg.id
+         WHERE p.id = ?
+         LIMIT 1`,
+        [userId, startStr, expireStr, startStr, expireStr, bonusBytes, signinPlanId]
+      );
+      planCreated = true;
     }
 
     // 7. 写入签到记录 & 更新用户表（放在同一事务中）
@@ -371,8 +343,8 @@ router.post('/signin', authMiddleware, async (req, res, next) => {
         bonusTraffic: bonusBytes,
         signinStreak: newStreak,
         trafficTotal: newTrafficTotal,
-        planExtended: hasActivePlan,
-        planCreated: !hasActivePlan && signinPlanId !== null
+        planExtended,
+        planCreated
       }
     });
   } catch (err) {
